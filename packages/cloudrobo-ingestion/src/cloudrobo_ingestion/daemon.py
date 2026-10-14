@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import json
 import logging
 import multiprocessing
 import os
@@ -22,7 +23,7 @@ import yaml
 from .config import IngestionConfig
 from .filesystem import RejectedBatch, discover, manifest, remove_staging
 from .lifecycle import InstanceLock, private_dir, runtime_dir, write_json
-from .progress import BatchProgress, Reporter, message_class
+from .progress import BatchProgress, DisabledReporter, Reporter, message_class
 from .store import BatchStore, now_ms
 from .worker import run_worker
 
@@ -59,7 +60,7 @@ class Supervisor:
     def initialize(self):
         for batch in self.store.rows():
             self.cleanup(batch)
-            if batch["pending"] is not None:
+            if self.config.reports and batch["pending"] is not None:
                 self.reporter.set(batch["id"], batch["pending"], terminal=True)
 
     def scan(self):
@@ -91,6 +92,8 @@ class Supervisor:
 
     @property
     def source(self):
+        if not self.config.reports:
+            return ""
         return f"{self.config.zenoh['project_id']}/{self.config.zenoh['device_id']}"
 
     def launch_next(self):
@@ -213,7 +216,7 @@ class Supervisor:
                             node.state = 0 if state == "interrupted" else 3
                         if state == "rejected":
                             node.state = 3
-                payload = p.serialize()
+                payload = p.serialize() if self.config.reports else None
             else:
                 payload = None
             delay = (
@@ -246,6 +249,7 @@ class Supervisor:
         active = self.store.get(self.active) if self.active else None
         return dict(
             state=state,
+            run_mode=self.config.run_mode,
             pid=os.getpid(),
             updated_ms=now_ms(),
             source_dir=str(self.config.source_dir),
@@ -304,15 +308,25 @@ class Supervisor:
             self.store.close()
 
 
-def main(config_path, handshake):
+def main(config_path, handshake, effective_path=None):
     root = runtime_dir()
     private_dir(root)
     z_path = None
     supervisor = listener = None
     try:
         with InstanceLock(root / "instance.lock"):
-            config = IngestionConfig.load(config_path)
+            config = (
+                IngestionConfig.from_mapping(
+                    json.loads(Path(effective_path).read_text(encoding="utf-8")),
+                    Path(config_path).resolve().parent,
+                )
+                if effective_path
+                else IngestionConfig.load(config_path)
+            )
             private_dir(config.work_dir)
+            from .workspace import check_mode
+
+            check_mode(config)
             handler = RotatingFileHandler(
                 config.work_dir / "ingestion.log",
                 maxBytes=5 * 1024 * 1024,
@@ -324,31 +338,41 @@ def main(config_path, handshake):
                 handlers=[handler],
                 format="%(asctime)s %(levelname)s %(name)s %(message)s",
             )
-            from cloudrobo_core.sdk import Config
+            logger.info("Starting ingestion run_mode=%s", config.run_mode)
+            if config.uploads:
+                from cloudrobo_core.sdk import Config
 
-            credentials = Config()
-            if not credentials.ak or not credentials.sk:
-                raise ValueError("OBS 凭证缺失，请配置 HUAWEI_CLOUD_AK / HUAWEI_CLOUD_SK")
+                credentials = Config()
+                if not credentials.ak or not credentials.sk:
+                    raise ValueError("OBS 凭证缺失，请配置 HUAWEI_CLOUD_AK / HUAWEI_CLOUD_SK")
             # Fail early on missing generated protobuf/runtime libraries, even
             # if the first batch has not arrived yet. Router availability is optional.
-            message_class()
-            from cloudrobo_r2c.common.config import ClientConfig
-            from cloudrobo_r2c.transport import ZenohTransport
+            reporter = DisabledReporter()
+            if config.reports:
+                message_class()
+                from cloudrobo_r2c.common.config import ClientConfig
+                from cloudrobo_r2c.transport import ZenohTransport
 
-            del ZenohTransport
-            fd, name = tempfile.mkstemp(prefix="zenoh-", suffix=".yaml", dir=config.work_dir)
-            z_path = Path(name)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                z = dict(config.zenoh)
-                z.setdefault("publisher_priority", "BACKGROUND")
-                z.setdefault("publisher_congestion_control", "DROP")
-                z.setdefault(
-                    "connect", dict(endpoints=z["endpoints"], timeout_ms=2000, exit_on_failure=True)
-                )
-                yaml.safe_dump(z, f, allow_unicode=True)
-            ClientConfig.from_yaml(z_path, None, None, None).validate()
-            reporter = Reporter(z_path, config.topic)
-            supervisor = Supervisor(config, reporter, root / "status.json")
+                del ZenohTransport
+                fd, name = tempfile.mkstemp(prefix="zenoh-", suffix=".yaml", dir=config.work_dir)
+                z_path = Path(name)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    z = dict(config.zenoh)
+                    z.setdefault("publisher_priority", "BACKGROUND")
+                    z.setdefault("publisher_congestion_control", "DROP")
+                    z.setdefault(
+                        "connect",
+                        dict(endpoints=z["endpoints"], timeout_ms=2000, exit_on_failure=True),
+                    )
+                    yaml.safe_dump(z, f, allow_unicode=True)
+                ClientConfig.from_yaml(z_path, None, None, None).validate()
+                reporter = Reporter(z_path, config.topic)
+            if config.run_mode == "mock_report":
+                from .mock_runtime import MockRunner
+
+                supervisor = MockRunner(config, reporter, root / "status.json")
+            else:
+                supervisor = Supervisor(config, reporter, root / "status.json")
             token = os.urandom(32)
             listener = Listener(("127.0.0.1", 0), authkey=token)
             write_json(root / "control.json", dict(port=listener.address[1], token=token.hex()))
@@ -372,7 +396,10 @@ def main(config_path, handshake):
                 signal.signal(sig, lambda *_: supervisor.stop_event.set())
             reporter.start()
             write_json(root / "status.json", supervisor.snapshot())
-            write_json(handshake, dict(pid=os.getpid(), work_dir=str(config.work_dir)))
+            write_json(
+                handshake,
+                dict(pid=os.getpid(), work_dir=str(config.work_dir), run_mode=config.run_mode),
+            )
             supervisor.run()
     except Exception as exc:
         logger.exception("Ingestion daemon failed")
@@ -387,4 +414,4 @@ def main(config_path, handshake):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    main(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)

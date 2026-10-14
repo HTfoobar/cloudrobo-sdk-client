@@ -2,14 +2,17 @@
 
 import threading
 import time
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
 
+import pytest
 from cloudrobo_ingestion.daemon import Supervisor
-from cloudrobo_ingestion.progress import Reporter, message_class
+from cloudrobo_ingestion.progress import DisabledReporter, Reporter, message_class
 
 
-def test_real_obs_sdk_in_spawned_worker(config, batch_dir, monkeypatch):
+@pytest.mark.parametrize("run_mode", ["upload_and_report", "upload_only"])
+def test_real_obs_sdk_in_spawned_worker(config, batch_dir, monkeypatch, run_mode):
     uploaded = []
 
     class OBSHandler(BaseHTTPRequestHandler):
@@ -56,7 +59,16 @@ def test_real_obs_sdk_in_spawned_worker(config, batch_dir, monkeypatch):
     monkeypatch.setenv("HUAWEI_CLOUD_AK", "test-ak")
     monkeypatch.setenv("HUAWEI_CLOUD_SK", "test-sk")
     monkeypatch.setenv("CLOUDROBO_OBS_ENDPOINT", f"http://127.0.0.1:{server.server_port}")
-    s = Supervisor(config, Reporter("unused", config.topic), config.work_dir / "status.json")
+    config = replace(config, run_mode=run_mode)
+    if run_mode == "upload_only":
+        from cloudrobo_ingestion import progress
+
+        def forbidden():
+            raise AssertionError("upload_only serialized protobuf")
+
+        monkeypatch.setattr(progress, "message_class", forbidden)
+    reporter = Reporter("unused", config.topic) if config.reports else DisabledReporter()
+    s = Supervisor(config, reporter, config.work_dir / "status.json")
     try:
         s.initialize()
         s.scan()
@@ -70,7 +82,11 @@ def test_real_obs_sdk_in_spawned_worker(config, batch_dir, monkeypatch):
         assert batch["state"] == "done", batch["error"]
         assert uploaded[0][1] == b"customer-data"
         assert "/prefix/批次001/data/file-000.parquet" in uploaded[0][0]
-        assert message_class().FromString(batch["pending"]).nodes[0].progress == 100
+        if config.reports:
+            assert message_class().FromString(batch["pending"]).nodes[0].progress == 100
+        else:
+            assert batch["pending"] is None
+            assert s.snapshot()["reporter"]["enabled"] is False
         assert not (config.work_dir / "staging" / batch["id"]).exists()
         assert not (config.work_dir / "checkpoints" / f"{batch['id']}.json").exists()
     finally:
