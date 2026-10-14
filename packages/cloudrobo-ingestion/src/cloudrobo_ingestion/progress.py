@@ -66,6 +66,8 @@ class Node:
             elapsed = at - oldest[0]
             if elapsed > 0:
                 rate = max(0, self.transferred - oldest[1]) / elapsed
+        estimate = (self.size - self.transferred) * 1000 / rate if rate else 0
+        eta_ms = int(estimate) if 0 <= estimate <= 2**63 - 1 else 0
         return dict(
             file_id=self.file_id,
             task_name=PurePosixPath(self.path).name,
@@ -78,15 +80,16 @@ class Node:
             if self.state == 2
             else (min(99.9, 100 * self.transferred / self.size) if self.size else 0.0),
             avg_bps=rate,
-            eta_ms=int((self.size - self.transferred) * 1000 / rate) if rate else 0,
+            eta_ms=eta_ms,
             task_type=batch["task_type"],
             collect_method=batch["collect_method"],
         )
 
 
 class BatchProgress:
-    def __init__(self, batch, entries, source):
+    def __init__(self, batch, entries, source, clock=None):
         self.batch, self.source = dict(batch), source
+        self.clock = clock or time.monotonic
         self.nodes = {
             e.path: Node(e.path, e.size, str(uuid.uuid5(uuid.UUID(batch["id"]), e.path)))
             for e in entries
@@ -96,11 +99,12 @@ class BatchProgress:
 
     def update(self, path, state, transferred=0):
         with self.lock:
-            self.nodes[path].update(state, transferred)
+            self.nodes[path].update(state, transferred, at=self.clock())
 
     def serialize(self):
         with self.lock:
-            values = [n.values(self.batch, time.monotonic()) for n in self.nodes.values()]
+            at = self.clock()
+            values = [n.values(self.batch, at) for n in self.nodes.values()]
             finished = self.finished
         m = message_class()(
             source=self.source,
@@ -165,7 +169,7 @@ class Reporter:
 
     def diagnostics(self):
         with self.lock:
-            return dict(self.status, pending_batches=len(self.slots))
+            return dict(self.status, enabled=True, pending_batches=len(self.slots))
 
     def _run(self):
         transport = None
@@ -226,3 +230,32 @@ class Reporter:
     def close(self):
         self.stop_event.set()
         self.thread.join(timeout=2)
+
+
+class DisabledReporter:
+    """Same supervisor interface, with no serialization, transport or background thread."""
+
+    def __init__(self):
+        self.acks = queue.Queue()
+
+    def set(self, *args, **kwargs):
+        pass
+
+    def remove(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+    def diagnostics(self):
+        return dict(
+            enabled=False,
+            state="disabled",
+            connected=False,
+            pending_batches=0,
+            last_published_ms=0,
+            error="",
+        )

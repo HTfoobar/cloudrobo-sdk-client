@@ -120,24 +120,34 @@ def status():
     return value
 
 
-def start(config_path):
+def start(config_path, overrides=None):
     from .config import IngestionConfig
+    from .workspace import check_mode
 
     config_path = Path(config_path).resolve()
-    config = IngestionConfig.load(config_path)
+    config = IngestionConfig.load(config_path, overrides=overrides)
+    check_mode(config)
     private_dir(runtime_dir())
     private_dir(config.work_dir)
     # Serialize competing start commands independently of the daemon lock.
     with InstanceLock(runtime_dir() / "start.lock"):
         if running():
             raise RuntimeError("已有回流进程正在运行")
+        check_mode(config)
         handshake = config.work_dir / ("startup-" + os.urandom(8).hex() + ".json")
+        # Pass the validated effective configuration rather than re-reading the
+        # original YAML in the child (which would lose CLI overrides).
+        fd, name = tempfile.mkstemp(prefix="effective-", suffix=".json", dir=config.work_dir)
+        effective = Path(name)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(config.to_mapping(), f, ensure_ascii=False)
         command = [
             sys.executable,
             "-m",
             "cloudrobo_ingestion.daemon",
             str(config_path),
             str(handshake),
+            str(effective),
         ]
         kwargs = dict(
             stdin=subprocess.DEVNULL,
@@ -151,7 +161,11 @@ def start(config_path):
             )
         else:
             kwargs["start_new_session"] = True
-        process = subprocess.Popen(command, **kwargs)
+        try:
+            process = subprocess.Popen(command, **kwargs)
+        except Exception:
+            effective.unlink(missing_ok=True)
+            raise
         deadline = time.monotonic() + 20
         try:
             while time.monotonic() < deadline:
@@ -172,6 +186,7 @@ def start(config_path):
             raise RuntimeError("后台进程启动超时")
         finally:
             handshake.unlink(missing_ok=True)
+            effective.unlink(missing_ok=True)
 
 
 def stop(timeout=15):

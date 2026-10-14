@@ -1,0 +1,16 @@
+run_mode: mock_report
+work_dir: ./ingestion-mock-work
+obs_path: obs://mock-bucket/ingestion/
+task_type: 超市取货
+collect_method: 遥操接管
+mock:
+  file_count: 10
+  file_size_bytes: 10485760
+  upload_bps: 2097152
+  batch_interval_seconds: 5
+zenoh:
+  mode: client
+  endpoint_role: connect
+  endpoints: [tcp/127.0.0.1:7447]
+  project_id: r2c
+  device_id: local

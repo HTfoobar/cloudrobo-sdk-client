@@ -13,6 +13,11 @@ def now_ms():
 
 class BatchStore:
     def __init__(self, config):
+        from .workspace import bind_mode
+
+        if not config.uploads:
+            raise ValueError("Mock 模式不使用真实批次数据库")
+        bind_mode(config)
         self.db = sqlite3.connect(config.work_dir / "batches.sqlite3")
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -28,7 +33,11 @@ class BatchStore:
                 files INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0
             );
         """)
-        for key, value in (("source_dir", str(config.source_dir)), ("obs_path", config.obs_path)):
+        for key, value in (
+            ("source_dir", str(config.source_dir)),
+            ("obs_path", config.obs_path),
+            ("run_mode", config.run_mode),
+        ):
             row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
             if row and row[0] != value:
                 self.db.close()

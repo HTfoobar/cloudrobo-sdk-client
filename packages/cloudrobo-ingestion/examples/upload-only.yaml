@@ -1,0 +1,7 @@
+run_mode: upload_only
+source_dir: ./customer-data
+work_dir: ./ingestion-upload-work
+obs_path: obs://customer-bucket/robot-data/
+validation:
+  enabled: false
+  format: lerobot_v3
