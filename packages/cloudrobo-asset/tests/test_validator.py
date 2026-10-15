@@ -26,7 +26,7 @@ def mock_client():
 
 class TestTypeSubtype:
     def test_valid_model(self, validator):
-        errors = validator.validate_create_asset({"type": "model", "catalog_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "name": "test-model"})
+        errors = validator.validate_create_asset({"type": "model", "catalog_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "name": "test-model", "ext_metadata": {"model_type": "planning"}})
         assert not any("type" in e or "sub_type" in e for e in errors)
 
     def test_invalid_type(self, validator):
@@ -41,13 +41,17 @@ class TestTypeSubtype:
         errors = validator.validate_create_asset({"type": "simulation", "sub_type": "invalid"})
         assert any("sub_type must be one of" in e for e in errors)
 
-    def test_algorithm_valid_subtype(self, validator):
+    def test_algorithm_subtype_ignored(self, validator):
         errors = validator.validate_create_asset({"type": "algorithm", "sub_type": "training"})
         assert not any("sub_type" in e for e in errors)
 
-    def test_algorithm_invalid_subtype(self, validator):
+    def test_algorithm_invalid_subtype_ignored(self, validator):
         errors = validator.validate_create_asset({"type": "algorithm", "sub_type": "robot"})
-        assert any("sub_type must be one of" in e for e in errors)
+        assert not any("sub_type" in e for e in errors)
+
+    def test_image_invalid_subtype_ignored(self, validator):
+        errors = validator.validate_create_asset({"type": "image", "sub_type": "whatever"})
+        assert not any("sub_type" in e for e in errors)
 
     def test_missing_type(self, validator):
         errors = validator.validate_create_asset({})
@@ -630,3 +634,86 @@ class TestUpdateVersion:
     def test_valid_update(self, validator):
         errors = validator.validate_update_version({"description": "updated", "status": "RELEASE"})
         assert not errors
+
+
+class TestTagsRequired:
+    UUID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+    def test_create_algorithm_without_tags_returns_error(self, validator):
+        errors = validator.validate_create_asset({
+            "type": "algorithm",
+            "catalog_id": self.UUID,
+            "name": "test-algo",
+            "ext_metadata": ALGO_BASE_WITH_SOURCE,
+        })
+        assert any("tags is required" in e and "algorithm" in e for e in errors)
+
+    def test_create_image_without_tags_returns_error(self, validator):
+        errors = validator.validate_create_asset({
+            "type": "image",
+            "catalog_id": self.UUID,
+            "ext_metadata": {"arch": "x86_64", "device_type": ["CPU"]},
+        })
+        assert any("tags is required" in e and "image" in e for e in errors)
+
+    def test_create_algorithm_with_tags_passes(self, validator):
+        errors = validator.validate_create_asset({
+            "type": "algorithm",
+            "catalog_id": self.UUID,
+            "name": "test-algo",
+            "tags": ["Train"],
+            "ext_metadata": ALGO_BASE_WITH_SOURCE,
+        })
+        assert not any("tags is required" in e for e in errors)
+
+    def test_create_algorithm_invalid_tag_returns_error(self, validator):
+        errors = validator.validate_create_asset({
+            "type": "algorithm",
+            "catalog_id": self.UUID,
+            "name": "test-algo",
+            "tags": ["Notebook"],
+            "ext_metadata": ALGO_BASE_WITH_SOURCE,
+        })
+        assert any("tags for type 'algorithm' must include at least one task scenario tag" in e for e in errors)
+
+    def test_create_algorithm_mixed_tags_with_task_tag_passes(self, validator):
+        """算法 tags 含非任务标签 + 至少一个任务标签时应通过（至少一个而非全部）"""
+        errors = validator.validate_create_asset({
+            "type": "algorithm",
+            "catalog_id": self.UUID,
+            "name": "test-algo",
+            "tags": ["Train", "pi05", "lerobot"],
+            "ext_metadata": ALGO_BASE_WITH_SOURCE,
+        })
+        assert not any("tags for type 'algorithm' must include" in e for e in errors)
+
+    def test_create_image_invalid_tag_returns_error(self, validator):
+        """镜像 tags 不含任何任务标签时应报错"""
+        errors = validator.validate_create_asset({
+            "type": "image",
+            "catalog_id": self.UUID,
+            "name": "test-img",
+            "tags": ["pi05", "lerobot"],
+            "ext_metadata": {"arch": "x86_64", "device_type": ["CPU"]},
+        })
+        assert any("tags for type 'image' must include at least one task scenario tag" in e for e in errors)
+
+    def test_create_image_mixed_tags_with_task_tag_passes(self, validator):
+        """镜像 tags 含任务标签 + 其他标签时应通过"""
+        errors = validator.validate_create_asset({
+            "type": "image",
+            "catalog_id": self.UUID,
+            "name": "test-img",
+            "tags": ["Data Processing", "pi05"],
+            "ext_metadata": {"arch": "x86_64", "device_type": ["CPU"]},
+        })
+        assert not any("tags for type 'image' must include" in e for e in errors)
+
+    def test_create_model_without_tags_passes(self, validator):
+        errors = validator.validate_create_asset({
+            "type": "model",
+            "catalog_id": self.UUID,
+            "name": "test-model",
+            "ext_metadata": {"model_type": "planning"},
+        })
+        assert not any("tags is required" in e for e in errors)

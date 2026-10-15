@@ -131,7 +131,7 @@ def create_asset(ctx, catalog_id, name, asset_type, sub_type, description, statu
     req = {"catalog_id": catalog_id, "type": asset_type}
     if name is not None:
         req["name"] = name
-    if sub_type is not None:
+    if sub_type is not None and asset_type == "simulation":
         req["sub_type"] = sub_type
     if description is not None:
         req["description"] = description
@@ -699,12 +699,12 @@ def list_publication_assets(ctx, asset_type, sub_type, ids, name, exact_name, ta
 @click.option("--sub-type", default=None, help="子类型")
 @click.option("--local-path", required=True, help="本地文件夹路径")
 @click.option("--asset-id", default=None, help="资产ID（创建新版本时必填）")
-@click.option("--version-id", default=None, help="版本ID，与--asset-id同时使用时复用已有版本（不创建新版本），用于增量上传/重试失败的上传")
-@click.option("--overwrite", is_flag=True, default=False, help="强制覆盖已存在的OBS文件（默认增量上传，仅--version-id模式生效）")
+@click.option("--version-id", default=None, help="版本ID，与--asset-id同时使用时复用已有版本（不创建新版本），用于给已有版本追加文件或重试失败的上传")
 @click.option("--ext-metadata", default=None, help="扩展元数据(JSON字符串)")
+@click.option("--tags", default=None, help="标签列表(逗号分隔)，algorithm类型必填")
 @click.option("--dry-run", is_flag=True)
 @click.pass_context
-def import_asset(ctx, catalog_id, name, asset_type, sub_type, local_path, asset_id, version_id, overwrite, ext_metadata, dry_run):
+def import_asset(ctx, catalog_id, name, asset_type, sub_type, local_path, asset_id, version_id, ext_metadata, tags, dry_run):
     """导入资产：注册资产+版本并上传到OBS"""
     fm = _safe_parse_frontmatter(local_path)
 
@@ -717,12 +717,15 @@ def import_asset(ctx, catalog_id, name, asset_type, sub_type, local_path, asset_
     resolved_description = fm.get("description")
     resolved_status = fm.get("status")
     resolved_tags = fm.get("tags")
+    if isinstance(resolved_tags, str):
+        resolved_tags = [t.strip() for t in resolved_tags.split(",") if t.strip()]
+    if tags:
+        cli_tags = [t.strip() for t in tags.split(",") if t.strip()]
+        resolved_tags = list(dict.fromkeys((resolved_tags or []) + cli_tags))
     resolved_ext_metadata = fm.get("ext_metadata") or ext_metadata
     resolved_parent = fm.get("parent_asset_version_id")
     resolved_gen_method = fm.get("generation_method")
 
-    if isinstance(resolved_tags, str):
-        resolved_tags = [t.strip() for t in resolved_tags.split(",") if t.strip()]
 
     if isinstance(resolved_ext_metadata, str):
         resolved_ext_metadata = _parse_json(resolved_ext_metadata, "ext_metadata")
@@ -765,6 +768,18 @@ def import_asset(ctx, catalog_id, name, asset_type, sub_type, local_path, asset_
                 errs = AssetValidator().validate_ext_metadata(resolved_type, resolved_sub_type, resolved_ext_metadata)
                 if errs:
                     raise click.UsageError("; ".join(errs))
+        if resolved_type == "image":
+            raise click.UsageError(
+                "image assets are not supported by import-asset. "
+                "Use cloudrobo asset create-asset instead."
+            )
+        if resolved_type == "algorithm":
+            if not resolved_tags or (isinstance(resolved_tags, list) and len(resolved_tags) == 0):
+                raise click.UsageError(
+                    "--tags is required for type algorithm: "
+                    "must have at least one task scenario tag "
+                    "(provide via README.md frontmatter or --tags)."
+                )
 
     if dry_run:
         if not os.path.exists(local_path):
@@ -776,8 +791,7 @@ def import_asset(ctx, catalog_id, name, asset_type, sub_type, local_path, asset_
                    f"status={resolved_status}, tags={resolved_tags}, "
                    f"ext_metadata={resolved_ext_metadata}, "
                    f"parent_asset_version_id={resolved_parent}, "
-                   f"generation_method={resolved_gen_method}, "
-                   f"overwrite={overwrite})")
+                   f"generation_method={resolved_gen_method})")
         return
     client = get_client(ctx, AssetClient)
     result = client.import_asset(
@@ -786,8 +800,7 @@ def import_asset(ctx, catalog_id, name, asset_type, sub_type, local_path, asset_
         asset_id=asset_id, version_id=version_id,
         description=resolved_description, ext_metadata=resolved_ext_metadata,
         version=resolved_version, status=resolved_status, tags=resolved_tags,
-        parent_asset_version_id=resolved_parent, generation_method=resolved_gen_method,
-        overwrite=overwrite
+        parent_asset_version_id=resolved_parent, generation_method=resolved_gen_method
     )
     out(result)
 

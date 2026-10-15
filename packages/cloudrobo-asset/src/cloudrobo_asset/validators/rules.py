@@ -4,8 +4,8 @@ from typing import Dict, Set
 TYPE_SUBTYPE_MAP: Dict[str, Set[str]] = {
     "model": set(),
     "dataset": set(),
-    "algorithm": {"inference", "data_processing", "training", "data_evaluating", "rl"},
-    "image": {"inference", "data_processing", "training", "notebook", "rl"},
+    "algorithm": set(),
+    "image": set(),
     "simulation": {"robot", "environment", "object", "scene"},
 }
 
@@ -26,6 +26,9 @@ VALID_FLAVOR_TYPES = {"CPU", "GPU", "NPU"}
 VALID_RESOURCE_VALUES = VALID_FLAVOR_TYPES | {"multiple", "singular"}
 
 VALID_IMAGE_SOURCES = {"preset", "custom"}
+
+ALGORITHM_TASK_TAGS = {"Data Processing", "Train"}
+IMAGE_TASK_TAGS = {"Data Processing", "Notebook", "Online Deployment", "Train"}
 
 SKILL_MODEL_TYPES = {"vla", "vln"}
 

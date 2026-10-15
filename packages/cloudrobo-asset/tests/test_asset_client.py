@@ -286,48 +286,9 @@ class TestImportExport:
 
     @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
     @patch("cloudrobo_asset.client.OBSClient")
-    def test_import_asset_mode3_default_incremental(self, mock_obs_cls, mock_exists):
-        """Mode 3 (asset_id + version_id) 默认增量上传，overwrite=False"""
-        self.mock_http.get.return_value = {"id": "v1", "url": "obs://bucket/prefix"}
-        mock_obs = MagicMock()
-        mock_obs.upload_folder.return_value = True
-        mock_obs_cls.return_value = mock_obs
-
-        result = self.client.import_asset(
-            catalog_id="cat1", name="m1", asset_type="model",
-            local_path="./model-dir", asset_id="asset1", version_id="v1",
-            ext_metadata={"model_type": "planning"}
-        )
-        assert result["id"] == "v1"
-        mock_obs.upload_folder.assert_called_once()
-        call_kwargs = mock_obs.upload_folder.call_args[1]
-        assert call_kwargs["overwrite"] is False
-
-    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
-    @patch("cloudrobo_asset.client.OBSClient")
-    def test_import_asset_mode3_overwrite_true(self, mock_obs_cls, mock_exists):
-        """Mode 3 传 overwrite=True 时强制覆盖"""
-        self.mock_http.get.return_value = {"id": "v1", "url": "obs://bucket/prefix"}
-        mock_obs = MagicMock()
-        mock_obs.upload_folder.return_value = True
-        mock_obs_cls.return_value = mock_obs
-
-        result = self.client.import_asset(
-            catalog_id="cat1", name="m1", asset_type="model",
-            local_path="./model-dir", asset_id="asset1", version_id="v1",
-            ext_metadata={"model_type": "planning"}, overwrite=True
-        )
-        assert result["id"] == "v1"
-        mock_obs.upload_folder.assert_called_once()
-        call_kwargs = mock_obs.upload_folder.call_args[1]
-        assert call_kwargs["overwrite"] is True
-
-    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
-    @patch("cloudrobo_asset.client.OBSClient")
     def test_import_asset_creating_to_draft(self, mock_obs_cls, mock_exists):
         """上传成功后版本状态为 CREATING 时自动更新为 DRAFT"""
         self.mock_http.get.side_effect = [
-            {"id": "asset1", "type": "model", "sub_type": None},  # show_asset
             {"id": "v1", "url": "obs://bucket/prefix", "status": "CREATING"},  # show_asset_version (before upload)
             {"id": "v1", "url": "obs://bucket/prefix", "status": "CREATING"},  # show_asset_version (after upload)
             {"id": "v1", "url": "obs://bucket/prefix", "status": "DRAFT"},  # show_asset_version (after update)
@@ -352,7 +313,6 @@ class TestImportExport:
     def test_import_asset_preserves_user_status(self, mock_obs_cls, mock_exists):
         """用户指定了非 CREATING 状态时，上传后不自动更新"""
         self.mock_http.get.side_effect = [
-            {"id": "asset1", "type": "model", "sub_type": None},  # show_asset
             {"id": "v1", "url": "obs://bucket/prefix", "status": "RELEASE"},  # show_asset_version (before upload)
             {"id": "v1", "url": "obs://bucket/prefix", "status": "RELEASE"},  # show_asset_version (after upload)
         ]
@@ -369,16 +329,20 @@ class TestImportExport:
         self.mock_http.put.assert_not_called()
 
     def test_export_asset_no_versions(self):
-        self.mock_http.get.return_value = {"data": []}
+        self.mock_http.get.side_effect = [
+            {"id": "asset1", "type": "model"},  # show_asset
+            {"data": []},  # list_asset_versions
+        ]
         with pytest.raises(RuntimeError, match="No versions found"):
             self.client.export_asset(asset_id="asset1", local_path="./out")
 
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
     @patch("cloudrobo_asset.client.os.makedirs")
     @patch("cloudrobo_asset.client.OBSClient")
-    def test_export_asset_success(self, mock_obs_cls, mock_makedirs):
+    def test_export_asset_success(self, mock_obs_cls, mock_makedirs, _):
         self.mock_http.get.side_effect = [
-            {"data": [{"id": "v1", "url": "obs://bucket/prefix"}]},  # list_asset_versions
             {"id": "asset1", "name": "test-asset", "type": "model", "tags": ["tag1"]},  # show_asset
+            {"data": [{"id": "v1", "url": "obs://bucket/prefix"}]},  # list_asset_versions
             {"id": "v1", "version": "1.0.0", "description": "test"},  # show_asset_version
         ]
         mock_obs = MagicMock()
@@ -394,12 +358,13 @@ class TestImportExport:
         assert result["local_path"] == os.path.join("./out", "asset1")
         mock_makedirs.assert_called_once_with(os.path.join("./out", "asset1"), exist_ok=True)
 
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
     @patch("cloudrobo_asset.client.os.makedirs")
     @patch("cloudrobo_asset.client.OBSClient")
-    def test_export_asset_with_version_id(self, mock_obs_cls, mock_makedirs):
+    def test_export_asset_with_version_id(self, mock_obs_cls, mock_makedirs, _):
         self.mock_http.get.side_effect = [
-            {"data": [{"id": "v2", "url": "obs://bucket/v2"}]},  # list_asset_versions
             {"id": "asset1", "name": "test-asset", "type": "model"},  # show_asset
+            {"data": [{"id": "v2", "url": "obs://bucket/v2"}]},  # list_asset_versions
             {"id": "v2", "version": "2.0.0"},  # show_asset_version
         ]
         mock_obs = MagicMock()
@@ -411,13 +376,14 @@ class TestImportExport:
         assert result["version_id"] == "v2"
         assert result["local_path"] == os.path.join("./out", "asset1")
 
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
     @patch("cloudrobo_asset.client.os.makedirs")
     @patch("cloudrobo_asset.client.OBSClient")
-    def test_export_asset_obs_download_fail(self, mock_obs_cls, mock_makedirs):
+    def test_export_asset_obs_download_fail(self, mock_obs_cls, mock_makedirs, _):
         self.mock_http.get.side_effect = [
-            {"data": [{"id": "v1", "url": "obs://bucket/prefix"}]},
-            {"id": "asset1", "latest_version_id": "v1"},
-            {"id": "v1", "version": "1.0.0"},
+            {"id": "asset1", "type": "model"},  # show_asset
+            {"data": [{"id": "v1", "url": "obs://bucket/prefix"}]},  # list_asset_versions
+            {"id": "v1", "version": "1.0.0"},  # show_asset_version
         ]
         mock_obs = MagicMock()
         mock_obs.download_folder.return_value = False
@@ -425,6 +391,71 @@ class TestImportExport:
 
         with pytest.raises(RuntimeError, match="Failed to download folder from OBS"):
             self.client.export_asset(asset_id="asset1", local_path="./out")
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
+    @patch("cloudrobo_asset.client.os.makedirs")
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_export_asset_algorithm(self, mock_obs_cls, mock_makedirs, _):
+        """算法资产从 ext_metadata.code_dir 获取 OBS URL"""
+        self.mock_http.get.side_effect = [
+            {"id": "algo1", "name": "my-algo", "type": "algorithm", "tags": ["Train"]},  # show_asset
+            {"data": [{"id": "v1"}]},  # list_asset_versions
+            {"id": "v1", "version": "1.0.0", "ext_metadata": {"code_dir": "obs://bucket/algo/code"}},  # show_asset_version
+        ]
+        mock_obs = MagicMock()
+        mock_obs.download_folder.return_value = True
+        mock_obs_cls.return_value = mock_obs
+
+        with patch("builtins.open", MagicMock()):
+            result = self.client.export_asset(asset_id="algo1", local_path="./out")
+        assert result["asset_id"] == "algo1"
+        assert result["status"] == "exported"
+        assert result["obs_url"] == "obs://bucket/algo/code"
+
+    def test_export_asset_image_rejected(self):
+        """镜像资产直接报错"""
+        self.mock_http.get.return_value = {"id": "img1", "type": "image"}
+        with pytest.raises(ValueError, match="does not support image assets"):
+            self.client.export_asset(asset_id="img1", local_path="./out")
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_import_asset_mode3_image_rejected(self, mock_obs_cls, mock_exists):
+        """Mode 3 + image 类型 -> ValueError"""
+        self.mock_http.get.return_value = {"id": "img1", "type": "image"}
+        with pytest.raises(ValueError, match="import_asset does not support image assets"):
+            self.client.import_asset(
+                catalog_id=None, asset_id="img1", version_id="v1", asset_type="image",
+                local_path="./img-dir",
+            )
+        mock_obs_cls.assert_not_called()
+
+    @patch("cloudrobo_asset.client.os.makedirs")
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_export_asset_algorithm_no_code_dir_raises(self, mock_obs_cls, mock_makedirs):
+        """算法资产 ext_metadata 无 code_dir -> RuntimeError 含 'code_dir' 关键字"""
+        self.mock_http.get.side_effect = [
+            {"id": "algo1", "name": "my-algo", "type": "algorithm", "tags": ["Train"]},
+            {"data": [{"id": "v1"}]},
+            {"id": "v1", "version": "1.0.0", "ext_metadata": {}},
+        ]
+        with pytest.raises(RuntimeError, match="code_dir"):
+            self.client.export_asset(asset_id="algo1", local_path="./out")
+        mock_obs_cls.assert_not_called()
+        mock_makedirs.assert_not_called()
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=False)
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_export_asset_local_path_not_found(self, mock_obs_cls, mock_exists):
+        """export-asset 本地路径不存在 -> FileNotFoundError"""
+        self.mock_http.get.side_effect = [
+            {"id": "asset1", "type": "model"},
+            {"data": [{"id": "v1", "url": "obs://bucket/prefix"}]},
+            {"id": "v1", "version": "1.0.0"},
+        ]
+        with pytest.raises(FileNotFoundError, match="Local path does not exist"):
+            self.client.export_asset(asset_id="asset1", local_path="/nonexistent")
+        mock_obs_cls.assert_not_called()
 
 
 class TestResolveVersion:
@@ -609,6 +640,24 @@ class TestImportAssetWithNewParams:
         assert req["status"] == "DRAFT"
         assert req["parent_asset_version_id"] == "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
         assert req["generation_method"] == "training"
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_import_asset_new_version_no_ext_metadata_raises_for_dataset(self, mock_obs_cls, mock_exists):
+        """Mode 2 dataset 类型不传 ext_metadata 应报错（后端要求必填，用户须显式传入，不自动复用）"""
+        self.mock_http.get.return_value = {
+            "id": "asset1", "type": "dataset", "sub_type": None
+        }
+        self.mock_http.post.return_value = {"id": "v2"}
+        mock_obs = MagicMock()
+        mock_obs.upload_folder.return_value = True
+        mock_obs_cls.return_value = mock_obs
+
+        with pytest.raises(ValueError, match="ext_metadata is required to create a new version"):
+            self.client.import_asset(
+                catalog_id="cat1", name="d1", asset_type="dataset",
+                local_path="./dataset-dir", asset_id="asset1",
+            )
 
 
 class TestSafeParseFrontmatter:
@@ -905,21 +954,21 @@ class TestImportAssetExtMetadataValidation:
 
     @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
     @patch("cloudrobo_asset.client.OBSClient")
-    def test_import_asset_new_version_no_ext_metadata_ok(self, mock_obs_cls, mock_exists):
-        """新建版本时不传 ext_metadata 应正常通过（不校验缺失）"""
+    def test_import_asset_new_version_no_ext_metadata_raises(self, mock_obs_cls, mock_exists):
+        """新建版本时 model 类型不传 ext_metadata 应报错（后端要求必填，用户须显式传入）"""
         self.mock_http.get.return_value = {
-            "id": "v2", "url": "obs://bucket/prefix"
+            "id": "asset1", "type": "model", "sub_type": None
         }
         self.mock_http.post.return_value = {"id": "v2"}
         mock_obs = MagicMock()
         mock_obs.upload_folder.return_value = True
         mock_obs_cls.return_value = mock_obs
 
-        result = self.client.import_asset(
-            catalog_id="cat1", name="m1", asset_type="model",
-            local_path="./model-dir", asset_id="asset1",
-        )
-        assert result["id"] == "v2"
+        with pytest.raises(ValueError, match="ext_metadata is required to create a new version"):
+            self.client.import_asset(
+                catalog_id="cat1", name="m1", asset_type="model",
+                local_path="./model-dir", asset_id="asset1",
+            )
 
 
 class TestCliImportAssetExtMetadata:
@@ -1045,3 +1094,286 @@ ext_metadata:
             ])
             assert result.exit_code == 0
             assert "DRY-RUN" in result.output
+
+
+class TestAlgorithmImageTagsConsistency:
+    UUID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+    def setup_method(self):
+        self.mock_http = _make_mock_client()
+        self.client = AssetClient(self.mock_http)
+        # 预填充 tag 缓存，避免 list_all_tags 网络调用
+        self.client._tag_cache["algorithm:"] = (
+            {"Train", "Data Processing"}, time.time()
+        )
+
+    def _algo_req(self, tags, image_asset_id=None):
+        engine = {
+            "image_url": "swr.region/org/repo:tag",
+            "image_source": "custom",
+        }
+        if image_asset_id:
+            engine["asset_id"] = image_asset_id
+        return {
+            "catalog_id": self.UUID,
+            "type": "algorithm",
+            "name": "test-algo",
+            "tags": tags,
+            "ext_metadata": {"engine": engine, "command": "run"},
+        }
+
+    def test_create_algorithm_tags_mismatch_with_image(self):
+        self.mock_http.get.return_value = {"id": "img1", "type": "image", "tags": ["Train"]}
+        self.mock_http.post.return_value = {"id": "algo1"}
+        with pytest.raises(Exception) as exc:
+            self.client.create_asset(self._algo_req(["Data Processing"], "img1"))
+        assert "must be a subset of" in str(exc.value)
+
+    def test_create_algorithm_tags_match_with_image(self):
+        self.mock_http.get.return_value = {"id": "img1", "type": "image", "tags": ["Train"]}
+        self.mock_http.post.return_value = {"id": "algo1"}
+        result = self.client.create_asset(self._algo_req(["Train"], "img1"))
+        assert result["id"] == "algo1"
+
+    def test_create_algorithm_tags_proper_subset_of_image(self):
+        # 算法 tags 是镜像 tags 的真子集，应通过
+        self.mock_http.get.return_value = {"id": "img1", "type": "image", "tags": ["Train", "Data Processing"]}
+        self.mock_http.post.return_value = {"id": "algo1"}
+        result = self.client.create_asset(self._algo_req(["Train"], "img1"))
+        assert result["id"] == "algo1"
+
+    def test_create_algorithm_without_image_asset_id_skips_check(self):
+        self.mock_http.post.return_value = {"id": "algo1"}
+        result = self.client.create_asset(self._algo_req(["Train"]))
+        assert result["id"] == "algo1"
+
+
+class TestImportAlgorithm:
+    UUID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+    def setup_method(self):
+        self.mock_http = _make_mock_client()
+        self.client = AssetClient(self.mock_http)
+        self.client._tag_cache["algorithm:"] = (
+            {"Train", "Data Processing"}, time.time()
+        )
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_import_algorithm_preset_placeholder_then_real_code_dir(self, mock_obs_cls, mock_exists):
+        """preset 场景：创建时 code_dir 占位，上传后更新为实际路径"""
+        self.mock_http.post.return_value = {"id": "algo1", "latest_version_id": "v1"}
+        # show_catalog -> cat1; show_asset_version(最终) -> v1
+        self.mock_http.get.side_effect = [
+            {"id": "cat1", "url": "obs://bucket/asset/repo1/cat1/"},  # show_catalog
+            {"id": "v1", "url": None},  # show_asset_version (after update)
+            {"id": "v1", "url": None},  # show_asset_version (method tail)
+        ]
+        mock_obs = MagicMock()
+        mock_obs.upload_folder.return_value = True
+        mock_obs_cls.return_value = mock_obs
+
+        result = self.client.import_asset(
+            catalog_id=self.UUID, name="my-algo", asset_type="algorithm",
+            local_path="./algo-code", tags=["Train"],
+            ext_metadata={
+                "engine": {"image_url": "swr.region/org/repo:tag", "image_source": "preset"},
+                "command": "python main.py",
+            },
+        )
+        assert result["id"] == "v1"
+        # 创建时 code_dir 占位为 catalog.url + /pending
+        create_json = self.mock_http.post.call_args.kwargs["json"]
+        assert create_json["ext_metadata"]["code_dir"] == "obs://bucket/asset/repo1/cat1/pending"
+        # 验证上传到 catalog.url + asset_id + version_id + /
+        # obs_prefix 不含 bucket
+        expected_prefix = "asset/repo1/cat1/algo1/v1/"
+        call_args = mock_obs.upload_folder.call_args[0]
+        assert call_args[1] == expected_prefix
+        # 验证 update_asset_version 补 code_dir 为实际路径
+        put_calls = [c for c in self.mock_http.put.call_args_list if c.args[0].endswith("/versions/v1")]
+        assert put_calls, "update_asset_version not called"
+        update_json = put_calls[-1].kwargs["json"]["ext_metadata"]
+        assert update_json["code_dir"] == "obs://bucket/asset/repo1/cat1/algo1/v1/"
+        assert "boot_file" not in update_json
+        # 验证 update_asset（asset 级别）也更新了 code_dir
+        asset_put_calls = [c for c in self.mock_http.put.call_args_list
+                           if c.args[0].endswith("/assets/algo1") and not c.args[0].endswith("/versions")]
+        assert asset_put_calls, "update_asset (asset-level) not called"
+        asset_update_json = asset_put_calls[-1].kwargs["json"]["ext_metadata"]
+        assert asset_update_json["code_dir"] == "obs://bucket/asset/repo1/cat1/algo1/v1/"
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_import_algorithm_custom_code_dir(self, mock_obs_cls, mock_exists):
+        """custom 场景：同样占位 code_dir，上传后更新"""
+        self.mock_http.post.return_value = {"id": "algo2", "latest_version_id": "v1"}
+        self.mock_http.get.side_effect = [
+            {"id": "cat1", "url": "obs://bucket/asset/repo1/cat1/"},  # show_catalog
+            {"id": "v1", "url": None},  # show_asset_version (after update)
+            {"id": "v1", "url": None},  # show_asset_version (method tail)
+        ]
+        mock_obs = MagicMock()
+        mock_obs.upload_folder.return_value = True
+        mock_obs_cls.return_value = mock_obs
+
+        result = self.client.import_asset(
+            catalog_id=self.UUID, name="my-algo", asset_type="algorithm",
+            local_path="./algo-code", tags=["Train"],
+            ext_metadata={
+                "engine": {"image_url": "swr.region/org/repo:tag", "image_source": "custom"},
+                "command": "python main.py",
+            },
+        )
+        assert result["id"] == "v1"
+        # obs_prefix 不含 bucket
+        expected_prefix = "asset/repo1/cat1/algo2/v1/"
+        call_args = mock_obs.upload_folder.call_args[0]
+        assert call_args[1] == expected_prefix
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_import_algorithm_subtype_dropped(self, mock_obs_cls, mock_exists):
+        """import_asset algorithm 时 sub_type 被丢弃，不传给后端"""
+        self.mock_http.post.return_value = {"id": "algo3", "latest_version_id": "v1"}
+        self.mock_http.get.side_effect = [
+            {"id": "cat1", "url": "obs://bucket/asset/repo1/cat1/"},  # show_catalog
+            {"id": "v1", "url": None},  # show_asset_version (after update)
+            {"id": "v1", "url": None},  # show_asset_version (method tail)
+        ]
+        mock_obs = MagicMock()
+        mock_obs.upload_folder.return_value = True
+        mock_obs_cls.return_value = mock_obs
+
+        self.client.import_asset(
+            catalog_id=self.UUID, name="my-algo", asset_type="algorithm",
+            sub_type="training", local_path="./algo-code", tags=["Train"],
+            ext_metadata={
+                "engine": {"image_url": "swr.region/org/repo:tag", "image_source": "custom"},
+                "command": "python main.py",
+            },
+        )
+        post_json = self.mock_http.post.call_args.kwargs["json"]
+        assert "sub_type" not in post_json
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_import_algorithm_mode2_creates_version_and_uploads(self, mock_obs_cls, mock_exists):
+        """Mode 2 算法：仅 asset_id，创建新版本 -> 拼接上传 -> 更新 code_dir，无需 catalog_id"""
+        # show_asset(asset_id) -> 含 catalog_id；show_catalog -> url；show_asset_version(尾部) -> v2
+        self.mock_http.get.side_effect = [
+            {"id": "algo1", "type": "algorithm", "catalog_id": "cat1"},  # show_asset
+            {"id": "cat1", "url": "obs://bucket/asset/repo1/cat1/"},  # show_catalog
+            {"id": "v2", "url": None},  # show_asset_version (mode2 branch)
+            {"id": "v2", "url": None},  # show_asset_version (method tail)
+        ]
+        self.mock_http.post.return_value = {"id": "v2"}
+        mock_obs = MagicMock()
+        mock_obs.upload_folder.return_value = True
+        mock_obs_cls.return_value = mock_obs
+
+        result = self.client.import_asset(
+            catalog_id=None, asset_id="algo1", asset_type="algorithm",
+            local_path="./algo-code", tags=["Train"],
+            ext_metadata={
+                "engine": {"image_url": "swr.region/org/repo:tag", "image_source": "custom"},
+                "command": "python main.py",
+            },
+        )
+        assert result["id"] == "v2"
+        # 上传到 catalog.url + asset_id + version_id + /
+        expected_prefix = "asset/repo1/cat1/algo1/v2/"
+        call_args = mock_obs.upload_folder.call_args[0]
+        assert call_args[1] == expected_prefix
+        # 更新 code_dir 为实际上传路径
+        put_calls = [c for c in self.mock_http.put.call_args_list if c.args[0].endswith("/versions/v2")]
+        assert put_calls, "update_asset_version not called"
+        update_json = put_calls[-1].kwargs["json"]["ext_metadata"]
+        assert update_json["code_dir"] == "obs://bucket/asset/repo1/cat1/algo1/v2/"
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_import_algorithm_mode3_rejected(self, mock_obs_cls, mock_exists):
+        """Mode 3 算法（asset_id + version_id）应直接报错"""
+        self.mock_http.get.return_value = {"id": "algo1", "type": "algorithm", "catalog_id": "cat1"}
+        with pytest.raises(ValueError, match="not supported for algorithm assets"):
+            self.client.import_asset(
+                catalog_id=None, asset_id="algo1", version_id="v1", asset_type="algorithm",
+                local_path="./algo-code",
+            )
+        # 不应发生任何上传
+        mock_obs_cls.assert_not_called()
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_import_algorithm_mode2_missing_ext_metadata_raises(self, mock_obs_cls, mock_exists):
+        """Mode 2 algorithm 不传 ext_metadata -> ValueError"""
+        self.mock_http.get.side_effect = [
+            {"id": "algo1", "type": "algorithm", "catalog_id": "cat1"},
+            {"id": "cat1", "url": "obs://bucket/asset/repo1/cat1/"},
+        ]
+        with pytest.raises(ValueError, match="ext_metadata is required to create a new version for algorithm asset"):
+            self.client.import_asset(
+                catalog_id=None, asset_id="algo1", asset_type="algorithm",
+                local_path="./algo-code", tags=["Train"],
+            )
+        mock_obs_cls.assert_not_called()
+
+    @patch("cloudrobo_asset.client.os.path.exists", return_value=True)
+    @patch("cloudrobo_asset.client.OBSClient")
+    def test_import_algorithm_mode2_invalid_ext_metadata_raises(self, mock_obs_cls, mock_exists):
+        """Mode 2 algorithm 传不完整的 ext_metadata（缺 engine）-> ValidationError"""
+        from cloudrobo_asset.validators import ValidationError
+        self.mock_http.get.side_effect = [
+            {"id": "algo1", "type": "algorithm", "catalog_id": "cat1"},
+            {"id": "cat1", "url": "obs://bucket/asset/repo1/cat1/"},
+        ]
+        with pytest.raises(ValidationError):
+            self.client.import_asset(
+                catalog_id=None, asset_id="algo1", asset_type="algorithm",
+                local_path="./algo-code", tags=["Train"],
+                ext_metadata={"command": "python main.py"},
+            )
+        mock_obs_cls.assert_not_called()
+
+
+class TestSubTypeDropped:
+    UUID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+    def setup_method(self):
+        self.mock_http = _make_mock_client()
+        self.client = AssetClient(self.mock_http)
+        self.client._tag_cache["algorithm:"] = ({"Train", "Data Processing"}, time.time())
+        self.client._tag_cache["image:"] = ({"Train", "Data Processing"}, time.time())
+
+    def test_create_algorithm_subtype_dropped(self):
+        """create_asset algorithm 传 sub_type 时被丢弃，post json 无 sub_type"""
+        self.mock_http.post.return_value = {"id": "algo1"}
+        self.client.create_asset({
+            "catalog_id": self.UUID,
+            "type": "algorithm",
+            "name": "test-algo",
+            "sub_type": "training",
+            "tags": ["Train"],
+            "ext_metadata": {
+                "engine": {"image_url": "swr.region/org/repo:tag", "image_source": "custom"},
+                "command": "run",
+            },
+        })
+        post_json = self.mock_http.post.call_args.kwargs["json"]
+        assert "sub_type" not in post_json
+
+    def test_create_image_subtype_ignored(self):
+        """create_asset image 传 sub_type 时不报错且 post json 无 sub_type"""
+        self.mock_http.post.return_value = {"id": "img1"}
+        result = self.client.create_asset({
+            "catalog_id": self.UUID,
+            "type": "image",
+            "name": "test-img",
+            "sub_type": "inference",
+            "tags": ["Data Processing"],
+            "ext_metadata": {"arch": "x86_64", "device_type": ["CPU"]},
+        })
+        assert result["id"] == "img1"
+        post_json = self.mock_http.post.call_args.kwargs["json"]
+        assert "sub_type" not in post_json

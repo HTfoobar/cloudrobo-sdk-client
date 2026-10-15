@@ -4,9 +4,11 @@ import json
 from typing import Any, Callable, Dict, List, Optional
 
 from .rules import (
+    ALGORITHM_TASK_TAGS,
     ASSET_FIELD_RULES,
     EXT_METADATA_RULES,
     HYPER_PARAMS_VALUE_PATTERN,
+    IMAGE_TASK_TAGS,
     SKILL_MODEL_TYPES,
     TYPE_SUBTYPE_MAP,
     VALID_TYPES,
@@ -23,12 +25,36 @@ class ValidationError(ValueError):
 class AssetValidator:
 
     def validate_create_asset(self, params: dict) -> List[str]:
+        # 后端不再使用 algorithm/image 的 sub_type（传了也默认忽略），客户端主动丢弃
+        if params.get("type") in ("algorithm", "image") and "sub_type" in params:
+            params.pop("sub_type")
         errors: List[str] = []
         errors.extend(self._validate_type_subtype(params))
         errors.extend(self._validate_top_fields(params, "create"))
         asset_type = params.get("type")
         if asset_type and asset_type != "image" and params.get("name") is None:
             errors.append("name is required when type is not 'image'")
+        if asset_type in ("algorithm", "image"):
+            tags = params.get("tags")
+            if not tags:
+                errors.append(
+                    f"tags is required for type '{asset_type}': "
+                    f"algorithm and image must have at least one task scenario tag"
+                )
+        if asset_type == "algorithm" and isinstance(params.get("tags"), list):
+            task_tags = [t for t in params["tags"] if t in ALGORITHM_TASK_TAGS]
+            if not task_tags:
+                errors.append(
+                    f"tags for type 'algorithm' must include at least one task scenario tag: "
+                    f"{', '.join(sorted(ALGORITHM_TASK_TAGS))}, got {params['tags']}"
+                )
+        if asset_type == "image" and isinstance(params.get("tags"), list):
+            task_tags = [t for t in params["tags"] if t in IMAGE_TASK_TAGS]
+            if not task_tags:
+                errors.append(
+                    f"tags for type 'image' must include at least one task scenario tag: "
+                    f"{', '.join(sorted(IMAGE_TASK_TAGS))}, got {params['tags']}"
+                )
         if params.get("parent_asset_version_id") and not params.get("generation_method"):
             errors.append("generation_method is required when parent_asset_version_id is provided")
         ext_metadata = params.get("ext_metadata")

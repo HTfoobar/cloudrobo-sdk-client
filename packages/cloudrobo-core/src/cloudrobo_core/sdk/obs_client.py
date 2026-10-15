@@ -1,7 +1,11 @@
 import os
+import time
 import logging
 from typing import Any, Dict, Optional
-from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn, TimeRemainingColumn
+from rich.progress import (
+    Progress, BarColumn, TextColumn, TaskProgressColumn,
+    TimeRemainingColumn
+)
 
 try:
     from obs import ObsClient
@@ -57,11 +61,23 @@ class OBSClient:
     def set_bucket(self, bucket_name: str):
         """
         Set default bucket
-        
+
         Args:
             bucket_name: Bucket name
         """
         self.bucket_name = bucket_name
+
+    @staticmethod
+    def _make_progress_callback(progress_bar: Progress, task_id) -> Optional[callable]:
+        """Create a byte-level progress callback for OBS SDK downloadFile/uploadFile."""
+        if progress_bar is None:
+            return None
+
+        def callback(transferred: int, total: int, seconds: float):
+            if total > 0:
+                progress_bar.update(task_id, completed=transferred, total=total)
+
+        return callback
 
     def create_bucket(self, bucket_name: str = None) -> bool:
         """
@@ -94,7 +110,8 @@ class OBSClient:
             return False
 
     def upload_file(self, local_path: str, obs_path: str, bucket_name: str = None,
-                     enable_checkpoint: bool = True, part_size: int = 9437184) -> bool:
+                    enable_checkpoint: bool = True, part_size: int = 9437184,
+                    progressCallback=None) -> bool:
         """
         Upload a single file to OBS (supports large files natively with resumable upload)
 
@@ -104,6 +121,7 @@ class OBSClient:
             bucket_name: Bucket name, use default bucket if not specified
             enable_checkpoint: Enable resumable upload, default is True
             part_size: Part size in bytes, default is 9MB (9437184)
+            progressCallback: Optional callback(transferred, total, seconds) for byte-level progress
 
         Returns:
             Return True if upload succeeds, otherwise False
@@ -119,16 +137,20 @@ class OBSClient:
             return False
 
         try:
-            response = self.client.uploadFile(
+            kwargs = dict(
                 bucketName=bucket_name,
                 objectKey=obs_path,
                 uploadFile=local_path,
                 enableCheckpoint=enable_checkpoint,
                 partSize=part_size,
             )
+            if progressCallback is not None:
+                kwargs['progressCallback'] = progressCallback
+            response = self.client.uploadFile(**kwargs)
 
             if response.status == 200:
-                logger.info(f"File uploaded successfully: {local_path} -> {obs_path}")
+                if progressCallback is None:
+                    logger.info(f"File uploaded successfully: {local_path} -> {obs_path}")
                 return True
             else:
                 logger.error(f"File upload failed, status code: {response.status}")
@@ -138,7 +160,8 @@ class OBSClient:
             return False
 
     def download_file(self, obs_path: str, local_path: str, bucket_name: str = None,
-                       enable_checkpoint: bool = True, part_size: int = 5242880) -> bool:
+                      enable_checkpoint: bool = True, part_size: int = 5242880,
+                      progressCallback=None) -> bool:
         """
         Download a single file from OBS (supports large files natively with resumable download)
 
@@ -148,6 +171,7 @@ class OBSClient:
             bucket_name: Bucket name, use default bucket if not specified
             enable_checkpoint: Enable resumable download, default is True
             part_size: Part size in bytes, default is 5MB (5242880)
+            progressCallback: Optional callback(transferred, total, seconds) for byte-level progress
 
         Returns:
             Return True if download succeeds, otherwise False
@@ -170,16 +194,20 @@ class OBSClient:
             if local_dir and not os.path.exists(local_dir):
                 os.makedirs(local_dir)
 
-            response = self.client.downloadFile(
+            kwargs = dict(
                 bucketName=bucket_name,
                 objectKey=obs_path,
                 downloadFile=local_path,
                 enableCheckpoint=enable_checkpoint,
                 partSize=part_size,
             )
+            if progressCallback is not None:
+                kwargs['progressCallback'] = progressCallback
+            response = self.client.downloadFile(**kwargs)
 
             if response.status == 200:
-                logger.info(f"File downloaded successfully: {obs_path} -> {local_path}")
+                if progressCallback is None:
+                    logger.info(f"File downloaded successfully: {obs_path} -> {local_path}")
                 return True
             else:
                 logger.error(f"File download failed, status code: {response.status}")
@@ -189,8 +217,8 @@ class OBSClient:
             return False
 
     def upload_folder(self, local_folder: str, obs_prefix: str, bucket_name: str = None,
-                       show_progress: bool = False, overwrite: bool = True,
-                       enable_checkpoint: bool = True, part_size: int = 9437184) -> bool:
+                      show_progress: bool = False, enable_checkpoint: bool = True,
+                      part_size: int = 9437184) -> bool:
         """
         Upload an entire folder to OBS
 
@@ -199,7 +227,6 @@ class OBSClient:
             obs_prefix: Prefix of folder on OBS
             bucket_name: Bucket name, use default bucket if not specified
             show_progress: Whether to show upload progress, default is False
-            overwrite: Whether to overwrite existing objects, default is True
             enable_checkpoint: Enable resumable upload, default is True
             part_size: Part size in bytes, default is 9MB (9437184)
 
@@ -242,25 +269,32 @@ class OBSClient:
                     TimeRemainingColumn(),
                 )
                 progress_bar.__enter__()
-                task = progress_bar.add_task("Uploading files", total=total_count)
+                task = progress_bar.add_task("Uploading files", total=1)
 
             for local_path in file_list:
                 rel_path = os.path.relpath(local_path, local_folder)
                 obs_path = os.path.join(obs_prefix, rel_path).replace("\\", "/")
-
-                if not overwrite and self.head_object(obs_path, bucket_name):
-                    success_count += 1
-                    if progress_bar:
-                        progress_bar.update(task, advance=1, description=f"Skipped (exists): {rel_path} ({success_count}/{total_count})")
-                    continue
+                file_size = os.path.getsize(local_path)
 
                 if progress_bar:
-                    progress_bar.update(task, description=f"Uploading: {rel_path}")
+                    progress_bar.reset(task, total=file_size, visible=True,
+                                       description=f"Uploading: {rel_path} ({success_count}/{total_count})")
 
-                if self.upload_file(local_path, obs_path, bucket_name, enable_checkpoint=enable_checkpoint, part_size=part_size):
+                file_start = time.time()
+                callback = self._make_progress_callback(progress_bar, task)
+                if self.upload_file(local_path, obs_path, bucket_name,
+                                    enable_checkpoint=enable_checkpoint, part_size=part_size,
+                                    progressCallback=callback):
                     success_count += 1
                     if progress_bar:
-                        progress_bar.update(task, advance=1, description=f"Uploaded: {rel_path} ({success_count}/{total_count})")
+                        progress_bar.update(task, completed=file_size, total=file_size,
+                                            description=f"Uploaded: {rel_path} ({success_count}/{total_count})")
+                        progress_bar.refresh()
+                        elapsed = time.time() - file_start
+                        if elapsed < 0.2:
+                            time.sleep(0.2 - elapsed)
+                    else:
+                        logger.info(f"File uploaded successfully: {local_path} -> {obs_path}")
 
             if progress_bar:
                 progress_bar.__exit__(None, None, None)
@@ -271,8 +305,8 @@ class OBSClient:
             return False
 
     def download_folder(self, obs_prefix: str, local_folder: str, bucket_name: str = None,
-                         show_progress: bool = False, enable_checkpoint: bool = True,
-                         part_size: int = 5242880) -> bool:
+                        show_progress: bool = False, enable_checkpoint: bool = True,
+                        part_size: int = 5242880) -> bool:
         """
         Download an entire folder from OBS
 
@@ -313,20 +347,34 @@ class OBSClient:
                     TimeRemainingColumn(),
                 )
                 progress_bar.__enter__()
-                task = progress_bar.add_task("Downloading files", total=total_count)
+                task = progress_bar.add_task("Downloading files", total=1)
 
             for obj in objects:
                 obs_path = obj['key']
                 rel_path = obs_path[len(obs_prefix):].lstrip('/')
                 local_path = os.path.join(local_folder, rel_path)
+                file_size = obj.get('size', 0) or 0
 
                 if progress_bar:
-                    progress_bar.update(task, description=f"Downloading: {rel_path}")
+                    progress_bar.reset(task, total=file_size if file_size > 0 else 1,
+                                       visible=True,
+                                       description=f"Downloading: {rel_path} ({success_count}/{total_count})")
 
-                if self.download_file(obs_path, local_path, bucket_name, enable_checkpoint=enable_checkpoint, part_size=part_size):
+                file_start = time.time()
+                callback = self._make_progress_callback(progress_bar, task)
+                if self.download_file(obs_path, local_path, bucket_name,
+                                      enable_checkpoint=enable_checkpoint, part_size=part_size,
+                                      progressCallback=callback):
                     success_count += 1
                     if progress_bar:
-                        progress_bar.update(task, advance=1, description=f"Downloaded: {rel_path} ({success_count}/{total_count})")
+                        progress_bar.update(task, completed=file_size, total=file_size,
+                                            description=f"Downloaded: {rel_path} ({success_count}/{total_count})")
+                        progress_bar.refresh()
+                        elapsed = time.time() - file_start
+                        if elapsed < 0.2:
+                            time.sleep(0.2 - elapsed)
+                    else:
+                        logger.info(f"File downloaded successfully: {obs_path} -> {local_path}")
 
             if progress_bar:
                 progress_bar.__exit__(None, None, None)
@@ -339,26 +387,26 @@ class OBSClient:
     def delete_object(self, obs_path: str, bucket_name: str = None) -> bool:
         """
         Delete object from OBS
-        
+
         Args:
             obs_path: Object path on OBS
             bucket_name: Bucket name, use default bucket if not specified
-            
+
         Returns:
             Return True if deletion succeeds, otherwise False
         """
         if bucket_name is None:
             bucket_name = self.bucket_name
-            
+
         if not bucket_name:
             raise ValueError("Bucket name cannot be empty")
-            
+
         try:
             response = self.client.deleteObject(
                 bucketName=bucket_name,
                 objectKey=obs_path
             )
-            
+
             if 200 <= response.status < 300:
                 logger.info(f"Object deleted successfully: {obs_path}")
                 return True
@@ -370,7 +418,7 @@ class OBSClient:
             return False
 
     def generate_presigned_url(self, obs_path: str, expires: int = 3600,
-                                bucket_name: str = None) -> str:
+                               bucket_name: str = None) -> str:
         """
         Generate presigned URL (GET method only)
 
@@ -408,41 +456,41 @@ class OBSClient:
     def list_objects(self, prefix: str = "", max_keys: int = 1000, bucket_name: str = None) -> list:
         """
         List objects in bucket
-        
+
         Args:
             prefix: Object name prefix filter
             max_keys: Maximum number of objects to return (default 1000)
             bucket_name: Bucket name, use default bucket if not specified
-            
+
         Returns:
             Object list
         """
         if bucket_name is None:
             bucket_name = self.bucket_name
-            
+
         if not bucket_name:
             raise ValueError("Bucket name cannot be empty")
-            
+
         try:
             objects = []
             marker = None
-            
+
             while True:
                 list_kwargs = {
                     'bucketName': bucket_name,
                     'prefix': prefix,
                     'max_keys': max_keys
                 }
-                
+
                 if marker:
                     list_kwargs['marker'] = marker
-                    
+
                 response = self.client.listObjects(**list_kwargs)
-                
+
                 if response.status != 200:
                     logger.error(f"Listing objects failed, status code: {response.status}")
                     return []
-                
+
                 if response.body.contents:
                     for obj in response.body.contents:
                         objects.append({
@@ -451,12 +499,12 @@ class OBSClient:
                             'last_modified': obj.lastModified,
                             'etag': obj.etag
                         })
-                
+
                 if getattr(response, 'isTruncated', False) and getattr(response, 'nextMarker', None):
                     marker = response.nextMarker
                 else:
                     break
-                    
+
             return objects
         except Exception as e:
             logger.error(f"Listing objects exception: {e}")

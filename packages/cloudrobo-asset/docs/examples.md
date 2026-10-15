@@ -24,6 +24,12 @@ cloudrobo asset show-catalog --catalog-id b2c3d4e5-f6a7-8901-bcde-f12345678901
 # 创建资产
 cloudrobo asset create-asset --catalog-id b2c3d4e5-f6a7-8901-bcde-f12345678901 --name base-model --type model --ext-metadata '{"model_type":"planning"}'
 
+# 创建算法资产（tags 必填，且必须是引用镜像 tags 的子集）
+cloudrobo asset create-asset --catalog-id b2c3d4e5-f6a7-8901-bcde-f12345678901 --name my-algo --type algorithm --tags Train --ext-metadata '{"engine":{"image_url":"swr.cn-southwest-2.myhuaweicloud.com/ns/repo:v1","image_source":"custom","asset_id":"<image-uuid>"},"command":"python train.py"}'
+
+# 创建镜像资产（tags 必填）
+cloudrobo asset create-asset --catalog-id b2c3d4e5-f6a7-8901-bcde-f12345678901 --type image --tags "Data Processing" --ext-metadata '{"arch":"x86_64","device_type":["CPU","GPU"]}'
+
 # 列出资产
 cloudrobo asset list-assets --repository-id a1b2c3d4-e5f6-7890-abcd-ef1234567890
 
@@ -133,17 +139,27 @@ cloudrobo asset import-asset --catalog-id b2c3d4e5-f6a7-8901-bcde-f12345678901 -
 # 导入资产（从 local-path/README.md frontmatter 读取元数据，仅需 --catalog-id）
 cloudrobo asset import-asset --catalog-id b2c3d4e5-f6a7-8901-bcde-f12345678901 --local-path ./my-model-dir
 
-# 为已有资产创建新版本并上传
-cloudrobo asset import-asset --asset-id c3d4e5f6-a7b8-9012-cdef-123456789012 --local-path ./my-model-v2
+# 导入算法资产（type=algorithm，tags 必填；本地代码上传到 catalog.url 下的 code_dir）
+cloudrobo asset import-asset --catalog-id b2c3d4e5-f6a7-8901-bcde-f12345678901 --name my-algo --type algorithm --tags Train --ext-metadata '{"engine":{"image_url":"swr.cn-southwest-2.myhuaweicloud.com/ns/repo:v1","image_source":"custom"},"command":"python train.py"}' --local-path ./my-algo-dir
 
-# 复用已有版本，增量上传新文件（默认跳过已存在的文件，用于重试失败的上传）
+# 为已有算法资产创建新版本并上传（Mode 2，无需 --catalog-id，从资产详情自动获取）
+cloudrobo asset import-asset --asset-id c3d4e5f6-a7b8-9012-cdef-123456789012 --type algorithm --tags Train --ext-metadata '{"engine":{"image_url":"swr.cn-southwest-2.myhuaweicloud.com/ns/repo:v1","image_source":"custom"},"command":"python train.py"}' --local-path ./my-algo-v2
+
+# 注意：import-asset 不支持 image 类型，镜像请使用 create-asset；算法资产不支持 --asset-id --version-id 增量复用（Mode 3）
+
+# 为已有资产创建新版本并上传（Mode 2，需传 ext-metadata）
+cloudrobo asset import-asset --asset-id c3d4e5f6-a7b8-9012-cdef-123456789012 --ext-metadata '{"model_type":"planning"}' --local-path ./my-model-v2
+
+# 复用已有版本，追加文件或重试失败的上传（OBS 同名对象幂等覆盖）
 cloudrobo asset import-asset --asset-id c3d4e5f6-a7b8-9012-cdef-123456789012 --version-id d4e5f6a7-b8c9-0123-defa-234567890123 --local-path ./my-model-v2
 
-# 复用已有版本，强制覆盖所有文件重新上传
-cloudrobo asset import-asset --asset-id c3d4e5f6-a7b8-9012-cdef-123456789012 --version-id d4e5f6a7-b8c9-0123-defa-234567890123 --local-path ./my-model-v2 --overwrite
-
-# 导出资产
+# 导出资产（model/dataset/simulation/algorithm）
 cloudrobo asset export-asset --asset-id c3d4e5f6-a7b8-9012-cdef-123456789012 --local-path ./download-dir
+
+# 导出算法资产（从 ext_metadata.code_dir 下载代码）
+cloudrobo asset export-asset --asset-id ae25b115-10d3-40cc-a333-dbd247c5054c --local-path ./algo-export
+
+# 注意：image 类型不支持 export-asset（SWR 引用，无可下载文件），请使用 create-asset 管理镜像
 ```
 
 ## SDK 示例

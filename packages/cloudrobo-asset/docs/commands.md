@@ -155,12 +155,18 @@ cloudrobo asset create-asset --catalog-id <id> --type <type> [--name <name>] [--
 | `--sub-type` | 否 | 子类型 |
 | `--description` | 否 | 描述 |
 | `--status` | 否 | 状态（CREATING/DRAFT/ALPHA/BETA/RELEASE/STABLE/DEPRECATED/ARCHIVE） |
-| `--tags` | 否 | 标签列表（逗号分隔） |
+| `--tags` | 条件必填 | 标签列表（逗号分隔），algorithm/image 类型必填 |
 | `--url` | 否 | OBS或SWR路径 |
-| `--ext-metadata` | 条件必填 | 扩展元数据（JSON字符串），model/dataset/algorithm/image/simulation 类型必填 |
+| `--ext-metadata` | 条件必填 | 扩展元数据（JSON字符串），model/dataset/algorithm/image/simulation 类型必填；**创建新版本（--asset-id）时也必填** |
 | `--parent-asset-version-id` | 否 | 父资产版本ID |
 | `--generation-method` | 否 | 资产生成方法 |
 | `--dry-run` | 否 | 仅预览 |
+
+**任务标签约束:**
+- `algorithm`/`image` 类型创建时必须提供 `--tags`（至少 1 个任务场景标签）；frontmatter 与 CLI 的 tags **合并去重**后校验
+- 算法 tags 允许值：`Data Processing`、`Train`（Notebook/Online Deployment 不支持创建算法）；**算法 tags 需至少含一个任务标签**（可混入其他标签，由后端校验）
+- 镜像 tags 允许值：`Data Processing`、`Notebook`、`Online Deployment`、`Train`
+- 算法引用了镜像（`ext_metadata.engine.asset_id`）时，算法 tags 必须是镜像 tags 的**子集**
 
 ---
 
@@ -221,7 +227,7 @@ cloudrobo asset update-asset --asset-id <id> [--name <name>] [--description <des
 | `--name` | 否 | 新名称 |
 | `--description` | 否 | 新描述 |
 | `--status` | 否 | 状态（CREATING/DRAFT/ALPHA/BETA/RELEASE/STABLE/DEPRECATED/ARCHIVE） |
-| `--tags` | 否 | 标签列表（逗号分隔，全量替换） |
+| `--tags` | 否 | 标签列表（逗号分隔，全量替换）；algorithm/image 类型更新时不能为空 |
 | `--ext-metadata` | 否 | 扩展元数据（JSON字符串） |
 | `--dry-run` | 否 | 仅预览 |
 
@@ -455,7 +461,7 @@ cloudrobo asset create-action --asset-id <id> --version-id <vid> --action-info <
 |------|------|------|
 | `--asset-id` | 是 | 资产ID |
 | `--version-id` | 是 | 版本ID |
-| `--action-info` | 是 | Action信息（JSON 格式） |
+| `--action-info` | 是 | Action信息（JSON 格式），支持单个 action 对象 `{"action":"FFT",...}` 或批量数组 `{"actions":[{...},{...}]}` |
 | `--dry-run` | 否 | 仅预览 |
 
 **action-info 结构**：
@@ -567,33 +573,54 @@ cloudrobo asset list-publication-assets [--type <type>] [--sub-type <sub>] [--id
 ### import-asset
 
 ```bash
-cloudrobo asset import-asset --local-path <path> [--catalog-id <id>] [--name <name>] [--type <type>] [--sub-type <sub>] [--ext-metadata <json>] [--asset-id <id>] [--version-id <vid>] [--overwrite] [--dry-run]
+cloudrobo asset import-asset --local-path <path> [--catalog-id <id>] [--name <name>] [--type <type>] [--sub-type <sub>] [--tags <tags>] [--ext-metadata <json>] [--asset-id <id>] [--version-id <vid>] [--dry-run]
 ```
 
 | 选项 | 必填 | 说明 |
 |------|------|------|
 | `--catalog-id` | 条件必填 | 目录ID，创建新资产时必填，创建新版本时不需要 |
 | `--name` | 条件必填 | 资产名称，创建新资产时必填（可从 README.md frontmatter 读取） |
-| `--type` | 条件必填 | 资产类型，创建新资产时必填（可从 README.md frontmatter 读取） |
+| `--type` | 条件必填 | 资产类型，创建新资产时必填（可从 README.md frontmatter 读取）；`image` 类型不支持 import-asset，请使用 create-asset |
 | `--sub-type` | 条件必填 | 子类型，simulation 类型时必填（可从 README.md frontmatter 读取） |
 | `--local-path` | 是 | 本地文件夹路径，自动从该路径下README.md读取frontmatter元数据 |
 | `--ext-metadata` | 条件必填 | 扩展元数据（JSON字符串），model/dataset/algorithm/image/simulation 类型必填 |
-| `--asset-id` | 否 | 资产ID，不传则创建新资产，传则创建新版本 |
-| `--version-id` | 否 | 版本ID，与 --asset-id 同时使用时复用已有版本（不创建新版本），用于增量上传/重试失败的上传 |
-| `--overwrite` | 否 | 强制覆盖已存在的OBS文件（默认增量上传，仅 --version-id 模式生效） |
+| `--tags` | 条件必填 | 标签列表（逗号分隔），algorithm 类型必填（可从 README.md frontmatter 读取） |
+| `--asset-id` | 否 | 资产ID，不传则创建新资产，传则创建新版本；**创建新版本时必须同时传 --ext-metadata** |
+| `--version-id` | 否 | 版本ID，与 --asset-id 同时使用时复用已有版本（不创建新版本），用于追加文件或重试失败的上传 |
 | `--dry-run` | 否 | 仅预览 |
 
 **流程**: 读取 README.md frontmatter → 解析参数（frontmatter > CLI）→ 校验 ext_metadata（仅新建资产路径）→ 根据模式执行：
 
 - **Mode 1（无 --asset-id）**: 创建新资产+版本 → 获取 OBS URL → 上传 → 若版本状态为 CREATING 则更新为 DRAFT
 - **Mode 2（仅 --asset-id）**: 校验资产存在 → 创建新版本 → 获取 OBS URL → 上传 → 若版本状态为 CREATING 则更新为 DRAFT
-- **Mode 3（--asset-id + --version-id）**: 校验资产+版本存在 → 获取 OBS URL → **增量上传**（跳过已存在的文件，仅上传新文件；用 `--overwrite` 强制覆盖全部）→ 若版本状态为 CREATING 则更新为 DRAFT
+- **Mode 3（--asset-id + --version-id）**: 校验资产+版本存在 → 获取 OBS URL → 直接上传（OBS 同名对象幂等覆盖）→ 若版本状态为 CREATING 则更新为 DRAFT；**算法资产不支持此模式（报错）**
+
+**算法导入（type=algorithm）:** 导入算法 = 将本地代码上传到 OBS 的 code_dir 目录，流程如下：
+
+- **Mode 1（新建资产，无需 --asset-id）**：
+  1. 校验 `--tags` 必填（算法类型，允许值 `Data Processing`/`Train`）
+  2. 获取 catalog.url，创建算法资产时 `code_dir` 占位为 `{catalog.url}/pending`（preset 镜像后端必填 code_dir）
+  3. 创建资产 → 得到 asset_id + version_id
+  4. 上传本地代码到 `{catalog.url}/{asset_id}/{version_id}/`
+  5. 更新 ext_metadata：`code_dir` 更新为实际上传路径（同时更新 asset 级别和 version 级别，消除占位 `pending`）
+  6. 版本状态 CREATING → DRAFT 自动修正
+
+- **Mode 2（已有算法资产创建新版本，仅 --asset-id）**：
+  1. 从资产详情取 catalog_id（**用户无需传 --catalog-id**）→ 获取 catalog.url
+  2. 移除用户 code_dir/boot_file，占位 code_dir = `{catalog.url}/pending`
+  3. 创建新版本 → 得到 version_id
+  4. 上传本地代码到 `{catalog.url}/{asset_id}/{version_id}/`
+  5. 更新 ext_metadata：`code_dir` 更新为实际上传路径（同时更新 asset 级别和 version 级别，消除占位 `pending`）
+  6. 版本状态 CREATING → DRAFT 自动修正
+
+- **Mode 3（--asset-id + --version-id）**: **不支持算法资产** — 直接报错
+  "Incremental upload (asset_id + version_id) is not supported for algorithm assets. Use --asset-id to create a new version, or import without asset-id to create a new asset."
+
+**路径示例:** `catalog.url = obs://bucket/asset/repo1/cat1/` 时，
+- 占位 code_dir：`obs://bucket/asset/repo1/cat1/pending`
+- 实际上传路径：`obs://bucket/asset/repo1/cat1/{asset_id}/{version_id}/`
 
 **状态流转:** 用户未指定 `--status` 时，后端创建版本默认状态为 `CREATING`（表示正在上传）。OBS 上传成功后，若版本状态仍为 `CREATING`，自动更新为 `DRAFT`。若用户通过 frontmatter 或 CLI 显式指定了其他状态（如 `RELEASE`），上传完成后不自动修改。
-
-**错误恢复:** 若 OBS 上传失败（Mode 1/2），资产和版本已创建但文件未上传，版本停留在 `CREATING` 状态。使用 `--asset-id --version-id` 重试上传，避免创建重复版本；上传成功后会自动将 `CREATING` 状态更新为 `DRAFT`。Mode 3 默认增量上传——只补传上次缺失的文件；需要全量重传时加 `--overwrite`。
-
-**增量上传:** Mode 3 默认开启增量上传（`overwrite=False`），对每个本地文件先检查 OBS 上是否已存在，存在则跳过。适用于给已存在版本继续追加新文件、或重试部分失败的上传。`--overwrite` 可强制覆盖已存在文件。
 
 **Frontmatter 字段:** 从 `local-path/README.md` YAML frontmatter 自动读取以下 10 个字段（frontmatter 优先级高于 CLI 参数）：
 `name`、`type`、`sub_type`、`description`、`status`、`tags`、`version`、`ext_metadata`、`parent_asset_version_id`、`generation_method`
@@ -608,7 +635,7 @@ cloudrobo asset import-asset --local-path <path> [--catalog-id <id>] [--name <na
 |------|----------|-----------|
 | `model` | `model_type` | `planning` / `perception` / `vla` / `vln`；`vla`/`vln` 支持可选 `skills`（≤50项,每项含 name[1-64字符,无首尾空格]+prompt[1-1024字符],prompt 不允许重复）和 `strict`（布尔） |
 | `dataset` | `annotation_status` | boolean |
-| `algorithm` | `engine` (必填 `image_url` 和 `image_source`), `command` | `engine` 中 `image_url` 和 `image_source` 均为必填；`image_source`: `preset` / `custom`; `image_url`: SWR 镜像格式 `swr.{endpoint}/{namespace}/{repo}:{tag}`；可选: `code_dir`(`boot_file`或`preset`时必填), `boot_file`(必须以 `obs://` 开头,以 `.py` 结尾,路径在 `code_dir` 之下), `inputs`(≤10), `outputs`(≤5), `hyperparams`(≤90), `environment_variables`(≤90), `resource`, `yaml_config` |
+| `algorithm` | `engine` (必填 `image_url` 和 `image_source`), `command` | `engine` 中 `image_url` 和 `image_source` 均为必填；`image_source`: `preset` / `custom`; `image_url`: SWR 镜像格式 `swr.{endpoint}/{namespace}/{repo}:{tag}`；可选: `code_dir`(`boot_file`或`preset`时必填), `boot_file`(必须以 `obs://` 开头,以 `.py` 结尾,路径在 `code_dir` 之下), `inputs`(≤10), `outputs`(≤5), `hyperparams`(≤90), `environment_variables`(≤90), `resource`, `yaml_config`。**导入时 `code_dir` 由工具自动填充（创建时占位 `{catalog.url}/pending`，上传后更新为实际路径），用户不应提供** |
 | `image` | `arch`, `device_type` | `sub_type`: `inference` / `data_processing` / `training` / `notebook` / `rl`；`arch`: `x86_64` / `arm`; `device_type`: `CPU` / `GPU` / `ASCEND` (数组) |
 | `simulation` | 无（`sub_type=robot` 时需 `robot_type`, `robot_manufacturer`） | `robot_type`: `humanoid` / `mobile_manipulator` / `robot_arm` / `quadruped_robot` / `wheeled_robot` / `other`; `robot_manufacturer`: 1-64字符,支持中英文/数字/连字符/点/下划线/空格 |
 
@@ -646,4 +673,8 @@ cloudrobo asset export-asset --asset-id <id> --local-path <path> [--version-id <
 | `--version-id` | 否 | 版本ID，不指定则导出最新版本 |
 | `--dry-run` | 否 | 仅预览 |
 
-**流程**: 查询版本列表 → 解析指定/最新版本 → 提取 OBS URL → 校验 local_path 非文件 → 查询资产/版本详情 → 创建目录 → 下载到 `local_path/<asset_id>/` → 生成 README.md（含 frontmatter 元数据）→ 返回导出结果
+**流程**: 查询资产详情获取 type → image 类型直接报错 → 查询版本列表 → 解析指定/最新版本 → algorithm 从 ext_metadata.code_dir 取 OBS URL，其他类型从 url 字段取 → 校验 local_path 存在且为目录（不存在报 FileNotFoundError，是文件报 ValueError）→ 创建 `local_path/<asset_id>/` 子目录 → 下载到子目录 → 生成 README.md（含 frontmatter 元数据）→ 返回导出结果
+
+**类型限制**:
+- **image 不支持**: 镜像资产是 SWR 引用，无可下载文件，直接报 ValueError
+- **algorithm 支持**: 从版本详情的 ext_metadata.code_dir 获取 OBS 路径下载代码
