@@ -166,7 +166,7 @@ class Supervisor:
         finally:
             child.close()
 
-    def drain(self):
+    def _drain_worker_events(self):
         if self.pipe:
             try:
                 while self.pipe.poll():
@@ -178,12 +178,27 @@ class Supervisor:
                         )
                     elif kind == "phase":
                         self.store.update(self.active, state=event["state"])
+                    elif kind == "log":
+                        logging.getLogger("cloudrobo_ingestion.worker").log(
+                            {
+                                "INFO": logging.INFO,
+                                "WARNING": logging.WARNING,
+                                "ERROR": logging.ERROR,
+                            }.get(event["level"], logging.INFO),
+                            "%s",
+                            event["message"],
+                        )
                     elif kind in ("result", "cleaned"):
                         self.result = event
             except (EOFError, OSError):
                 pass
+
+    def drain(self):
+        self._drain_worker_events()
         if self.process and not self.process.is_alive():
             self.process.join()
+            # The child may have sent its final log/result after the first poll.
+            self._drain_worker_events()
             self._finish()
         while True:
             try:
