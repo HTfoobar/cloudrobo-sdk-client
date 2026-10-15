@@ -125,6 +125,24 @@ OBS SDK checkpoint 独立于副本，确认分段上传中止后删除；强制�
 残留分段，建议桶设置清理未完成 multipart 的生命周期策略作为兜底。
 清理失败不丢记录，暂停该批次并继续其他任务。
 
+日志位于本次运行实际使用的 `work_dir/ingestion.log`（包括 CLI `--work-dir`
+覆盖后的目录），单文件最大 5 MiB，保留 3 份轮转备份 `ingestion.log.1`～`.3`。
+上传子进程通过 IPC 将日志交给主进程统一写入，记录批次 ID、失败阶段、文件、
+本地副本和 OBS 目标。OBS 失败时记录可用的 HTTP 状态码、错误码、请求 ID；
+异常保留脱敏消息、errno/Windows winerror 和调用栈位置，不记录凭证、签名
+查询参数或栈局部变量。`status` / `status --json` 也显示失败摘要。
+
+Windows PowerShell 实时查看（将路径替换为实际工作目录）：
+
+```powershell
+cloudrobo ingestion status --json
+Get-Content 'C:\data\ingestion-upload-work\ingestion.log' -Tail 100 -Wait
+```
+
+例如 `stage=uploading; http_status=403; error_code=AccessDenied` 表示 OBS
+权限错误；`stage=copying` 加 `winerror` 表示复制阶段的 Windows 文件操作错误。
+此改动只对升级并重启后的失败生效，旧日志中被省略的原因无法恢复。
+
 每秒发送每批全量节点，不限制为 8 KB。状态变更即时发送，断连期间只保留最新
 快照及待发布最终消息，不积压逐秒历史。超限等无法生成完整节点清单的错误通过
 本地 status/log 展示；现有协议没有错误原因字段。

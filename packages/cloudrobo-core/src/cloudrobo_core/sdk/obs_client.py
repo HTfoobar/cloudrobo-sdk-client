@@ -11,6 +11,12 @@ except ImportError as ex:
     raise ImportError("Please install esdk-obs-python SDK: pip install esdk-obs-python") from ex
 
 from cloudrobo_core.sdk.config import Config
+from cloudrobo_core.sdk.obs_diagnostics import (
+    UploadLogCapture,
+    credential_values,
+    exception_details,
+    response_details,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +41,7 @@ class OBSClient:
         self.access_key = self.config.ak
         self.secret_key = self.config.sk
         self.endpoint = self._resolve_endpoint()
+        self.last_upload_error = None
 
         # Create OBS client instance
         try:
@@ -116,7 +123,9 @@ class OBSClient:
 
         Returns:
             Return True if upload succeeds, otherwise False
+            On failure, last_upload_error contains sanitized diagnostic fields.
         """
+        self.last_upload_error = None
         if bucket_name is None:
             bucket_name = self.bucket_name
 
@@ -124,9 +133,17 @@ class OBSClient:
             raise ValueError("Bucket name cannot be empty")
 
         if not os.path.exists(local_path):
+            self.last_upload_error = exception_details(
+                FileNotFoundError(2, "Local upload file does not exist", local_path),
+                credential_values(self),
+            )
             logger.error(f"Local file does not exist: {local_path}")
             return False
 
+        sdk_log = getattr(self.client, "log_client", None)
+        capture = UploadLogCapture(sdk_log, credential_values(self)) if sdk_log is not None else None
+        if capture is not None:
+            self.client.log_client = capture
         try:
             options = {}
             if progress_callback is not None:
@@ -142,15 +159,22 @@ class OBSClient:
                 **options,
             )
 
-            if response.status == 200:
+            if response is not None and response.status == 200:
                 logger.info(f"File uploaded successfully: {local_path} -> {obs_path}")
                 return True
             else:
-                logger.error(f"File upload failed, status code: {response.status}")
+                self.last_upload_error = response_details(response, credential_values(self))
+                logger.error("File upload failed: %s", self.last_upload_error)
                 return False
         except Exception as e:
-            logger.error(f"File upload exception: {e}")
+            self.last_upload_error = exception_details(e, credential_values(self))
+            logger.error("File upload exception: %s", self.last_upload_error)
             return False
+        finally:
+            if capture is not None:
+                self.client.log_client = sdk_log
+                if self.last_upload_error and capture.messages:
+                    self.last_upload_error["sdk_errors"] = list(capture.messages)
 
     def abort_checkpoint_upload(self, checkpoint_file: str) -> bool:
         """Abort an interrupted SDK upload before discarding its local checkpoint.

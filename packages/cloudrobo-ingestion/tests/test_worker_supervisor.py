@@ -58,6 +58,58 @@ def test_worker_obs_and_progress(config, batch_dir, monkeypatch, success):
     store.close()
 
 
+def test_worker_reports_windows_error_with_stack_and_stage(config, batch_dir, monkeypatch):
+    from cloudrobo_core.sdk import obs_client
+
+    class OBS:
+        def __init__(self, **kwargs):
+            self.access_key, self.secret_key = "test-private-ak", "test-private-sk"
+
+        def upload_file(self, *args, **kwargs):
+            error = PermissionError(13, "checkpoint locked test-private-sk")
+            error.winerror = 32
+            raise error
+
+        def close(self):
+            raise OSError("close failed test-private-ak")
+
+    monkeypatch.setattr(obs_client, "OBSClient", OBS)
+    store = BatchStore(config)
+    batch = store.add("批次001", config)
+    conn = Connection()
+    run_worker(config, batch, manifest(batch_dir), conn)
+    result = next(e for e in conn.messages if e["event"] == "result")
+    assert "stage=uploading" in result["error"]
+    assert "PermissionError" in result["error"]
+    assert "winerror=32" in result["error"] and "errno=13" in result["error"]
+    logs = "\n".join(e["message"] for e in conn.messages if e["event"] == "log")
+    assert "stack" in logs and "upload_file" in logs
+    assert "OBS client close failed" in logs
+    assert "test-private-ak" not in str(conn.messages)
+    assert "test-private-sk" not in str(conn.messages)
+    store.close()
+
+
+def test_copy_failure_is_identified_before_obs_upload(config, batch_dir, monkeypatch):
+    from cloudrobo_ingestion import worker
+
+    def fail_copy(*args):
+        raise PermissionError(13, "source cannot be read", str(batch_dir / "data/file-000.parquet"))
+
+    monkeypatch.setattr(worker, "checked_copy", fail_copy)
+    store = BatchStore(config)
+    batch = store.add("批次001", config)
+    conn = Connection()
+    run_worker(config, batch, manifest(batch_dir), conn)
+    result = next(e for e in conn.messages if e["event"] == "result")
+    assert "stage=copying" in result["error"]
+    assert "source cannot be read" in result["error"]
+    logs = "\n".join(e["message"] for e in conn.messages if e["event"] == "log")
+    assert "source_path" in logs and "file-000.parquet" in logs
+    assert "Uploading file" not in logs
+    store.close()
+
+
 def successful_child(config, batch, entries, connection, cleanup_only):
     if cleanup_only:
         connection.send(dict(event="cleaned"))
