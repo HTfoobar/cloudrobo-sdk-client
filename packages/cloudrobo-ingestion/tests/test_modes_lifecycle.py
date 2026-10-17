@@ -1,0 +1,148 @@
+import os
+import socket
+import time
+
+import pytest
+import yaml
+from cloudrobo_ingestion.lifecycle import running, start, status, stop
+
+
+def wait_for(predicate, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.05)
+    raise AssertionError("Timed out waiting for daemon state")
+
+
+def unused_endpoint():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return f"tcp/127.0.0.1:{s.getsockname()[1]}"
+
+
+def install_import_guard(tmp_path, monkeypatch, condition):
+    hook = tmp_path / "import-guard"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(
+        "import builtins\n_original = builtins.__import__\n"
+        "def _guard(name, *args, **kwargs):\n"
+        f"    if {condition}:\n"
+        "        raise AssertionError('forbidden import: ' + name)\n"
+        "    return _original(name, *args, **kwargs)\n"
+        "builtins.__import__ = _guard\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PYTHONPATH", str(hook) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
+
+
+@pytest.mark.parametrize("run_mode", ["upload_only", "mock_report"])
+def test_real_child_receives_effective_cli_configuration(
+    config_file, tmp_path, monkeypatch, run_mode
+):
+    monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("HUAWEI_CLOUD_AK", "test-ak")
+    monkeypatch.setenv("HUAWEI_CLOUD_SK", "test-sk")
+    before = config_file.read_bytes()
+    work = tmp_path / f"{run_mode}-work"
+    result = start(
+        config_file,
+        dict(
+            run_mode=run_mode,
+            work_dir=str(work),
+            task_type="CLI-task",
+            collect_method="CLI-method",
+            mock_file_count=3,
+            mock_file_size_bytes=100,
+            mock_upload_bps=10,
+            mock_batch_interval_seconds=0,
+            zenoh_endpoint=(unused_endpoint(),),
+        ),
+    )
+    try:
+        assert result["run_mode"] == run_mode and result["work_dir"] == str(work)
+        assert config_file.read_bytes() == before
+        assert not (tmp_path / "work").exists()
+        state = wait_for(lambda: status() if status().get("run_mode") == run_mode else None)
+        assert state["work_dir"] == str(work) and state["running"]
+        if run_mode == "mock_report":
+            state = wait_for(
+                lambda: status() if status().get("progress", {}).get("files") == 3 else None
+            )
+            assert state["mock"] and state["source_dir"] is None
+            assert not (work / "batches.sqlite3").exists()
+            assert not (work / "staging").exists() and not (work / "checkpoints").exists()
+        else:
+            assert state["reporter"]["enabled"] is False
+            assert not list(work.glob("zenoh-*.yaml"))
+        assert not list(work.glob("effective-*.json"))
+        assert stop()["run_mode"] == run_mode
+        assert not running()
+    finally:
+        if running():
+            stop()
+
+
+def test_pure_daemon_without_reporting_imports(config_file, tmp_path, monkeypatch):
+    install_import_guard(
+        tmp_path, monkeypatch, "name.startswith(('cloudrobo_r2c', 'zenoh', 'google.protobuf'))"
+    )
+    monkeypatch.setenv("HUAWEI_CLOUD_AK", "test-ak")
+    monkeypatch.setenv("HUAWEI_CLOUD_SK", "test-sk")
+    data = yaml.safe_load(config_file.read_text())
+    del data["task_type"], data["collect_method"]
+    data["run_mode"] = "upload_only"
+    data["zenoh"] = "unused-invalid-settings"
+    config_file.write_text(yaml.safe_dump(data))
+    start(config_file)
+    try:
+        assert status()["run_mode"] == "upload_only"
+        assert status()["reporter"]["enabled"] is False
+    finally:
+        stop()
+
+
+def test_mock_daemon_does_not_access_obs_or_customer_source(config_file, tmp_path, monkeypatch):
+    install_import_guard(
+        tmp_path,
+        monkeypatch,
+        "name == 'obs' or name.startswith('obs.') or name.endswith('obs_client')",
+    )
+    monkeypatch.delenv("HUAWEI_CLOUD_AK", raising=False)
+    monkeypatch.delenv("HUAWEI_CLOUD_SK", raising=False)
+    data = yaml.safe_load(config_file.read_text())
+    data.update(
+        run_mode="mock_report",
+        source_dir=str(tmp_path / "nonexistent-source"),
+        zenoh=dict(endpoints=[unused_endpoint()]),
+    )
+    config_file.write_text(yaml.safe_dump(data))
+    start(config_file)
+    try:
+        s = wait_for(lambda: status() if status().get("progress", {}).get("files") else None)
+        assert s["mock"] and s["run_mode"] == "mock_report" and s["source_dir"] is None
+        work = tmp_path / "work"
+        assert not (work / "batches.sqlite3").exists() and not (work / "staging").exists()
+        assert not (tmp_path / "nonexistent-source").exists()
+    finally:
+        stop()
+
+
+def test_mock_initialization_cannot_modify_default_history(
+    config, config_file, tmp_path, monkeypatch
+):
+    from cloudrobo_ingestion.store import BatchStore
+
+    store = BatchStore(config)
+    b = store.add("completed", config)
+    store.update(b["id"], state="done", pending=b"durable-real-final")
+    store.close()
+    monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
+    before = (config.work_dir / "batches.sqlite3").read_bytes()
+    with pytest.raises(ValueError, match="绑定模式"):
+        start(config_file, dict(run_mode="mock_report"))
+    assert (config.work_dir / "batches.sqlite3").read_bytes() == before
+    assert not (tmp_path / "runtime").exists()

@@ -96,7 +96,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 # Ship the config directory (and all subdirectories) inside the installed
 # package so users get the example configs after pip install.
-cloudrobo_r2c = ["config/**/*"]
+cloudrobo_r2c = ["config/**/*", "common/protos/*.proto"]
 
 [tool.setuptools.cmdclass]
 compile_protobuf = "cloudrobo_r2c._build_commands.CompileProtobufCommand"

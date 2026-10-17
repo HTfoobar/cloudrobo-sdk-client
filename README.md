@@ -1,5 +1,9 @@
 # CloudRobo Client
 
+Local data ingestion is available through `cloudrobo ingestion start/status/stop`.
+See [ingestion setup, configuration and recovery](packages/cloudrobo-ingestion/README.md).
+The full bundle requires Python >=3.10; individual legacy packages retain their own requirements.
+
 CloudRobo command-line tool and Python SDK for Huawei Cloud's Embodied Intelligence Platform (CloudRobo) - resource management and task orchestration.
 
 [中文文档](README_CN.md)
