@@ -71,7 +71,9 @@ def test_start_failure_propagates_and_releases_lock(config_file, tmp_path, monke
     c.work_dir.mkdir()
     BatchStore(c).close()
     data = yaml.safe_load(config_file.read_text())
-    data["obs_path"] = "obs://different/target/"
+    other_source = config_file.parent / "different-source"
+    other_source.mkdir()
+    data["source_dir"] = str(other_source)
     config_file.write_text(yaml.safe_dump(data))
     monkeypatch.setenv("HUAWEI_CLOUD_AK", "test-ak")
     monkeypatch.setenv("HUAWEI_CLOUD_SK", "test-sk")

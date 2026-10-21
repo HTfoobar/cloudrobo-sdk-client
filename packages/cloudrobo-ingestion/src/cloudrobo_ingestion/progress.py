@@ -23,6 +23,10 @@ def message_class():
     return DataUploadProgress
 
 
+def serialize_snapshot(snapshot):
+    return message_class()(**snapshot).SerializeToString()
+
+
 def data_type(name):
     ext = PurePosixPath(name).suffix.lower()
     if ext in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
@@ -141,20 +145,21 @@ class BatchProgress:
         if failed:
             self.mark_failed()
 
-    def serialize(self):
+    def snapshot(self):
         with self.lock:
             at = self.clock()
             values = [n.values(self.batch, at) for n in self.nodes.values()]
             finished = self.finished
-        m = message_class()(
+        return dict(
             source=self.source,
             timestamp=self.batch["timestamp"],
             asset_path=self.batch["asset_path"],
             task_state=int(finished),
+            nodes=values,
         )
-        for value in values:
-            m.nodes.add(**value)
-        return m.SerializeToString()
+
+    def serialize(self):
+        return serialize_snapshot(self.snapshot())
 
     def summary(self):
         with self.lock:

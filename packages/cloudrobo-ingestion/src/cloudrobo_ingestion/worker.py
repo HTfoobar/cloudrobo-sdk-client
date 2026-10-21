@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from urllib.parse import urlsplit
 
 from .diagnostics import DiagnosticError, make_error, summary
 from .filesystem import InterruptedBatch, RejectedBatch, checked_copy
@@ -43,6 +44,8 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
     upload_error = None
     obs_endpoint = None
     obs_secrets = ()
+    target = urlsplit(batch["asset_path"])
+    bucket, prefix = target.netloc, target.path.lstrip("/")
 
     def failure(exc=None, diagnostic=None):
         component = (
@@ -106,7 +109,8 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
 
         if checkpoint.exists():
             stage = "checkpoint_cleanup"
-            client = OBSClient(config=credentials, bucket_name=config.bucket, timeout=5)
+            # abort_checkpoint_upload uses the original bucket/key inside the checkpoint.
+            client = OBSClient(config=credentials, bucket_name=bucket, timeout=5)
             if not client.abort_checkpoint_upload(str(checkpoint)):
                 raise OSError("无法确认 OBS 分段上传已清理")
         if cleanup_only:
@@ -129,9 +133,12 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
             validate_lerobot(staging, stop)
         if stop.is_set():
             raise InterruptedBatch()
-        if entries and client is None:
+        if entries:
             stage = "obs_initializing"
-            client = OBSClient(config=credentials, bucket_name=config.bucket, timeout=30)
+            # Cleanup used a short timeout; uploads need their normal timeout.
+            if client is not None:
+                client.close()
+            client = OBSClient(config=credentials, bucket_name=bucket, timeout=30)
         stage = "uploading"
         send("phase", state="uploading")
         for entry in entries:
@@ -150,9 +157,7 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
                 if stop.is_set():
                     raise InterruptedBatch()
 
-            key = (
-                batch["asset_path"].split("/", 3)[3] if "/" in batch["asset_path"][6:] else ""
-            ) + entry.path
+            key = prefix + entry.path
             log(
                 "INFO",
                 "Uploading file",

@@ -1,6 +1,7 @@
 run_mode: upload_only
 source_dir: ./customer-data
-work_dir: ./ingestion-upload-work
+# 与默认模式共享历史；修改 run_mode 即可切换，Mock 使用独立目录。
+work_dir: ./ingestion-work
 obs_path: obs://customer-bucket/robot-data/
 max_files_per_batch: 100
 validation:

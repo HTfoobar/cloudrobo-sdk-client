@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 
 
 def now_ms():
@@ -32,27 +35,61 @@ class BatchStore:
                 retry_at REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', error_info TEXT,
                 cleanup_error_info TEXT,
                 cleanup_pending INTEGER NOT NULL DEFAULT 0, pending BLOB,
+                report_enabled INTEGER NOT NULL DEFAULT 0, final_snapshot TEXT,
                 files INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0
             );
         """)
-        for key, value in (
-            ("source_dir", str(config.source_dir)),
-            ("obs_path", config.obs_path),
-            ("run_mode", config.run_mode),
-        ):
-            row = self.db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-            if row and row[0] != value:
-                self.db.close()
-                raise ValueError(f"工作目录绑定的 {key} 不同，请使用新的工作目录")
-            self.db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (key, value))
+        source = str(config.source_dir)
+        row = self.db.execute("SELECT value FROM settings WHERE key='source_dir'").fetchone()
+        if row and row[0] != source:
+            self.db.close()
+            raise ValueError("工作目录绑定的 source_dir 不同，请使用新的工作目录")
+        self.db.execute("INSERT OR IGNORE INTO settings VALUES ('source_dir',?)", (source,))
         self.db.commit()
+        self.configure_batches(config)
+
+    @staticmethod
+    def target(config, path):
+        return config.obs_path + (path.rstrip("/") + "/" if path != "." else "")
+
+    def configure_batches(self, config):
+        """Apply startup policy without touching completed upload history."""
+        changed = 0
+        with self.db:
+            for batch in self.db.execute("SELECT * FROM batches WHERE state!='done'").fetchall():
+                target = self.target(config, batch["path"])
+                if target != batch["asset_path"]:
+                    self.db.execute(
+                        "UPDATE batches SET asset_path=?,pending=NULL WHERE id=?",
+                        (target, batch["id"]),
+                    )
+                    changed += 1
+                    logger.info(
+                        "OBS 目标变更 batch_id=%s old=%s new=%s；未完成批次将整批重试",
+                        batch["id"],
+                        batch["asset_path"],
+                        target,
+                    )
+                if config.reports and not batch["report_enabled"]:
+                    self.db.execute(
+                        """UPDATE batches SET report_enabled=1,
+                        task_type=?,collect_method=? WHERE id=?""",
+                        (
+                            batch["task_type"] or config.task_type,
+                            batch["collect_method"] or config.collect_method,
+                            batch["id"],
+                        ),
+                    )
+        if changed:
+            logger.info("OBS 目标已调整，受影响未完成批次：%s", changed)
 
     def add(self, path, config):
-        asset_path = config.obs_path + (path.rstrip("/") + "/" if path != "." else "")
+        asset_path = self.target(config, path)
         with self.db:
             self.db.execute(
                 """INSERT OR IGNORE INTO batches
-                (id,path,asset_path,timestamp,task_type,collect_method) VALUES (?,?,?,?,?,?)""",
+                (id,path,asset_path,timestamp,task_type,collect_method,report_enabled)
+                VALUES (?,?,?,?,?,?,?)""",
                 (
                     str(uuid.uuid4()),
                     path,
@@ -60,6 +97,7 @@ class BatchStore:
                     now_ms(),
                     config.task_type,
                     config.collect_method,
+                    int(config.reports),
                 ),
             )
         return self._decode(
@@ -74,7 +112,7 @@ class BatchStore:
     @staticmethod
     def _decode(row):
         result = dict(row)
-        for key in ("error_info", "cleanup_error_info"):
+        for key in ("error_info", "cleanup_error_info", "final_snapshot"):
             result[key] = json.loads(result[key]) if result[key] else None
         return result
 
@@ -82,6 +120,15 @@ class BatchStore:
         return [
             self._decode(r)
             for r in self.db.execute("SELECT * FROM batches ORDER BY timestamp,path")
+        ]
+
+    def finals_to_prepare(self):
+        return [
+            self._decode(r)
+            for r in self.db.execute(
+                """SELECT * FROM batches WHERE state='done'
+                AND final_snapshot IS NOT NULL AND pending IS NULL"""
+            )
         ]
 
     def update(self, batch_id, **values):
@@ -96,10 +143,11 @@ class BatchStore:
             "pending",
             "files",
             "bytes",
+            "final_snapshot",
         }
         if not values.keys() <= allowed:
             raise ValueError("Invalid batch update")
-        for key in ("error_info", "cleanup_error_info"):
+        for key in ("error_info", "cleanup_error_info", "final_snapshot"):
             if values.get(key) is not None:
                 values[key] = json.dumps(values[key], ensure_ascii=False)
         with self.db:
@@ -111,7 +159,8 @@ class BatchStore:
     def acknowledge(self, batch_id, payload):
         with self.db:
             self.db.execute(
-                "UPDATE batches SET pending=NULL WHERE id=? AND pending=?", (batch_id, payload)
+                "UPDATE batches SET pending=NULL,final_snapshot=NULL WHERE id=? AND pending=?",
+                (batch_id, payload),
             )
 
     def recover(self):

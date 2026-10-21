@@ -275,39 +275,39 @@ def test_cli_all_mock_overrides_roundtrip(config_file):
     assert IngestionConfig.from_mapping(c.to_mapping(), config_file.parent) == c
 
 
-def test_work_dir_binding_and_legacy_default(config):
+def test_work_dir_purpose_and_unsupported_old_marker(config):
     store = BatchStore(config)
     b = store.add("batch", config)
     store.update(b["id"], state="done", pending=b"original-pending")
     store.close()
-    for mode in ("upload_only", "mock_report"):
-        with pytest.raises(ValueError, match="独立 work_dir"):
-            check_mode(replace(config, run_mode=mode))
-    (config.work_dir / "mode.json").unlink()  # simulate a pre-mode installation
-    check_mode(config)
-    with pytest.raises(ValueError, match="upload_and_report"):
-        check_mode(replace(config, run_mode="upload_only"))
+    check_mode(replace(config, run_mode="upload_only"))
+    with pytest.raises(ValueError, match="独立 work_dir"):
+        check_mode(replace(config, run_mode="mock_report"))
     recovered = BatchStore(config)
     assert recovered.get(b["id"])["pending"] == b"original-pending"
     assert recovered.get(b["id"])["state"] == "done"
     recovered.close()
+    marker = config.work_dir / "mode.json"
+    marker.write_text(json.dumps(dict(run_mode="upload_and_report")))
+    with pytest.raises(ValueError, match="版本不支持"):
+        check_mode(config)
+    marker.unlink()
+    with pytest.raises(ValueError, match="缺少用途标记"):
+        check_mode(config)
 
 
-def test_two_real_modes_keep_history_independent(config):
+def test_two_real_modes_share_success_history(config):
     first = BatchStore(config)
     a = first.add("same-source-batch", config)
     first.update(a["id"], state="done", pending=b"real-final")
-    other_dir = config.work_dir.parent / "upload-only-work"
-    other_dir.mkdir()
-    pure = replace(
-        config, work_dir=other_dir, run_mode="upload_only", task_type="", collect_method=""
-    )
+    first.close()
+    pure = replace(config, run_mode="upload_only", task_type="", collect_method="")
     second = BatchStore(pure)
     b = second.add("same-source-batch", pure)
-    assert a["id"] != b["id"]
-    assert b["state"] == "queued" and b["pending"] is None
-    second.update(b["id"], state="done")
+    assert a["id"] == b["id"] and a["timestamp"] == b["timestamp"]
+    assert b["state"] == "done" and b["pending"] == b"real-final"
     second.close()
+    first = BatchStore(config)
     assert first.get(a["id"])["pending"] == b"real-final"
     first.close()
 
@@ -315,7 +315,7 @@ def test_two_real_modes_keep_history_independent(config):
 def test_mock_binding_does_not_create_database(config):
     mock = replace(config, run_mode="mock_report", source_dir=None)
     bind_mode(mock)
-    assert json.loads((config.work_dir / "mode.json").read_text())["run_mode"] == "mock_report"
+    assert json.loads((config.work_dir / "mode.json").read_text())["purpose"] == "mock"
     assert not (config.work_dir / "batches.sqlite3").exists()
-    with pytest.raises(ValueError, match="绑定模式"):
+    with pytest.raises(ValueError, match="绑定用途"):
         check_mode(config)

@@ -16,13 +16,17 @@
 | mock_report | 不上传 | 每秒模拟进度 | [mock.yaml](examples/mock.yaml) |
 
 旧配置未设置 `run_mode` 时保持默认行为。三个模式仍共享用户级单实例控制，
-同一时刻仅运行一个。每个模式必须使用独立工作目录，不自动切换或搬迁目录。
+同一时刻仅运行一个。默认模式和仅上传模式共用工作目录及成功记录；Mock 必须使用独立目录。
 
 ```bash
 cloudrobo ingestion start --config upload-only.yaml
 cloudrobo ingestion start --config mock.yaml
-# 切换模式需要先 stop，并指定该模式独立工作目录
-cloudrobo ingestion start --config ingestion.yaml --run-mode upload_only --work-dir ./upload-work
+# 切换真实上传模式：先停止，再使用同一配置和工作目录启动
+cloudrobo ingestion stop
+cloudrobo ingestion start --config ingestion.yaml --run-mode upload_only
+# 恢复上报，已经成功的批次不会重复上传
+cloudrobo ingestion stop
+cloudrobo ingestion start --config ingestion.yaml --run-mode upload_and_report
 ```
 
 ## 安装和启动
@@ -121,9 +125,11 @@ LeRobot V3 应在 `finalize()` 完成后于整个数据集根目录创建标记�
 ## 恢复和结果
 
 真实上传模式的工作目录包含 `mode.json`、`batches.sqlite3`、`staging/`、
-`checkpoints/` 和轮转日志。`mode.json` 绑定模式，不允许另一模式复用。
-已有批次数据库且没有模式标记的目录按默认模式识别。
-数据库只保存批次记录，不保存逐文件恢复进度；首次入队时间和批次 UUID 持久化。
+`checkpoints/` 和轮转日志。`mode.json` 绑定用途（真实上传或 Mock），两种真实模式可以复用。
+当前功能尚未上线，本次不兼容旧工作目录结构；旧测试目录需要更换为新的空目录，
+不提供迁移脚本。新结构建立后可持续共享上传历史。
+数据库保存批次记录及必要的一次性最终补报结果，不保存逐秒快照或逐文件恢复进度；
+首次入队时间和批次 UUID 持久化。
 文件 UUIDv5 从批次 UUID 和相对路径派生，重试/重启稳定。
 
 ### 上传失败与重试的展示
@@ -152,12 +158,30 @@ LeRobot V3 应在 `finalize()` 完成后于整个数据集根目录创建标记�
 成功或失败都清理数据副本。复制/上传错误按 5～300 秒退避重试，每次重新复制
 并整批重传，可能覆盖之前上传成功的对象；OBS 上可能存在未完成批次的部分文件。
 拒绝类错误本次运行不重复尝试，修正后下次启动重新检查。成功批次不会重传。
-工作目录绑定源目录和 OBS 目标，改变任一项请使用新工作目录。
+工作目录只绑定源目录，不绑定 OBS 地址。更换源目录仍需要新工作目录。
 
-两个真实模式的记录完全独立，不共享成功历史、不跨模式补报。切回默认模式仅
-恢复其自己的记录。两个模式使用同一源目录时，同一批次可能各上传一次，
-后一次会覆盖同路径对象；若希望避免重复上传，可使用不同源目录。
-只上传模式不初始化 Zenoh、不导入 Protobuf、不生成上报缓存，本地进度仍可查询。
+### 模式切换与补报
+
+两种真实模式共用成功记录，切换不会重新上传已成功的批次；未完成批次保持 UUID、
+首次入队时间并继续整批重试。默认模式建立的批次标记为已纳入上报，切到仅上传时
+暂停发布；这些批次在仅上传期间成功后保存一次最终结果 JSON，切回默认时补报成功。
+因此副本清理或已完成源批次被移走后，仍能补齐结果。
+
+仅上传期间新建且已完成的批次不会在以后补报。尚未完成的批次切回默认时开始上报，
+缺失的分类从当前配置补齐并固定，已有分类保持不变。最终成功结果替代过时的失败消息；
+本地发布调用完成后清除待发布结果，上传成功记录长期保留。切换模式沿用相同的
+Zenoh 身份和 topic，不提供跨身份迁移。
+
+仅上传模式不初始化 Zenoh、不导入 Protobuf、不生成 Protobuf 上报缓存，本地进度仍可查询；
+只为原有上报任务保留必要的最终结果 JSON。
+
+### 修改 OBS 地址
+
+修改配置或使用 `--obs-path` 后重新启动：已成功批次保持原实际地址，不自动重传，
+其待补报结果也保持原地址；未完成批次更新为新目标并整批重试，新批次使用新目标。
+批次身份和首次入队时间保持不变，日志记录目标变化及受影响批次数量。
+旧目标已上传的对象不会自动删除；旧 checkpoint 按原 bucket 和对象路径清理，
+清理未确认时暂停该批次，不会将旧分段上传复用到新地址。
 
 `stop` 尽快停止当前子进程，超过 5 秒终止；未完成批次下次启动重新复制。
 OBS SDK checkpoint 独立于副本，确认分段上传中止后删除；强制终止时可能有远端
@@ -205,7 +229,7 @@ Windows PowerShell 实时查看（将路径替换为实际工作目录）：
 
 ```powershell
 cloudrobo ingestion status --json
-Get-Content 'C:\data\ingestion-upload-work\ingestion.log' -Tail 100 -Wait
+Get-Content 'C:\data\ingestion-work\ingestion.log' -Tail 100 -Wait
 ```
 
 例如 `OBS_ACCESS_DENIED` 加 HTTP 403 / `AccessDenied` 表示 OBS 访问被拒绝；

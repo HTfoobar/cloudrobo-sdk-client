@@ -22,10 +22,10 @@ from pathlib import Path
 import yaml
 
 from .config import IngestionConfig
-from .diagnostics import DiagnosticError, log_error, make_error, summary
+from .diagnostics import DiagnosticError, ErrorTracker, log_error, make_error, summary
 from .filesystem import RejectedBatch, discover, manifest, remove_staging
 from .lifecycle import InstanceLock, private_dir, runtime_dir, write_json
-from .progress import BatchProgress, DisabledReporter, Reporter, message_class
+from .progress import BatchProgress, DisabledReporter, Reporter, message_class, serialize_snapshot
 from .store import BatchStore, now_ms
 from .worker import run_worker
 
@@ -47,6 +47,8 @@ class Supervisor:
         self.cleanup_only = False
         self.last_error = ""
         self.error_info = None
+        self.final_errors = {}
+        self.next_final_retry = 0.0
         self.context = multiprocessing.get_context("spawn")
 
     def batch_error(self, batch, info, *, cleanup=False, **updates):
@@ -61,7 +63,7 @@ class Supervisor:
 
     def fail_progress(self, batch_id):
         progress = self.progress.get(batch_id)
-        if progress is None:
+        if progress is None or progress.finished:
             return
         progress.mark_failed()
         # Wake the publisher before persisting; a DB fault must not hide failure.
@@ -116,8 +118,33 @@ class Supervisor:
     def initialize(self):
         for batch in self.store.rows():
             self.cleanup(batch)
-            if self.config.reports and batch["pending"] is not None:
+            if self.config.reports and batch["final_snapshot"] is not None:
+                self.queue_final(batch)
+            elif self.config.reports and batch["pending"] is not None:
                 self.reporter.set(batch["id"], batch["pending"], terminal=batch["state"] == "done")
+
+    def queue_final(self, batch):
+        """Materialize the durable final result only when reporting is enabled."""
+        if not self.config.reports:
+            return
+        batch_id = batch["id"]
+        try:
+            payload = batch["pending"]
+            if payload is None:
+                snapshot = dict(batch["final_snapshot"], source=self.source)
+                payload = serialize_snapshot(snapshot)
+                self.store.update(batch_id, pending=payload)
+        except Exception as exc:
+            if isinstance(exc, sqlite3.Error):
+                raise
+            self.final_errors.setdefault(batch_id, ErrorTracker(logger)).failed(
+                make_error("local", "serialize", exc, context=dict(batch_id=batch_id))
+            )
+            return
+        tracker = self.final_errors.pop(batch_id, None)
+        if tracker:
+            tracker.recovered()
+        self.reporter.set(batch_id, payload, terminal=True)
 
     def scan(self):
         for source in discover(self.config.source_dir):
@@ -285,6 +312,10 @@ class Supervisor:
             except queue.Empty:
                 break
             self.store.acknowledge(batch_id, payload)
+        if self.config.reports and time.monotonic() >= self.next_final_retry:
+            self.next_final_retry = time.monotonic() + 1
+            for batch in self.store.finals_to_prepare():
+                self.queue_final(batch)
 
     def _finish(self):
         batch = self.store.get(self.active)
@@ -323,6 +354,7 @@ class Supervisor:
         else:
             state = result["state"]
             p = self.progress.get(self.active)
+            final_snapshot = None
             if p:
                 if state in ("failed", "rejected"):
                     p.mark_failed()
@@ -333,8 +365,10 @@ class Supervisor:
                             for node in p.nodes.values():
                                 if node.state == 1:
                                     node.state = 0
+                if state == "done" and batch["report_enabled"]:
+                    final_snapshot = p.snapshot()
                 try:
-                    payload = p.serialize() if self.config.reports else None
+                    payload = p.serialize() if self.config.reports and state != "done" else None
                 except Exception as exc:
                     info = make_error("local", "serialize", exc, context=dict(batch_id=batch["id"]))
                     log_error(logger, info)
@@ -356,8 +390,11 @@ class Supervisor:
                 error_info=info,
                 retry_at=time.time() + delay,
                 pending=payload,
+                final_snapshot=final_snapshot,
             )
-            if payload is not None:
+            if final_snapshot is not None:
+                self.queue_final(self.store.get(self.active))
+            elif payload is not None:
                 self.reporter.set(
                     self.active, payload if state == "done" else p, terminal=state == "done"
                 )
@@ -384,6 +421,8 @@ class Supervisor:
             if info
         ]
         current = self.error_info
+        if current is None:
+            current = next((tracker.info for tracker in self.final_errors.values()), None)
         if current is None and batch_errors:
             current = batch_errors[-1]["error_info"]
         return dict(

@@ -44,12 +44,12 @@ def test_done_survives_recover_outbox_ack_is_conditional(config):
     store.close()
 
 
-def test_target_binding(config):
+def test_source_binding(config):
     from dataclasses import replace
 
     BatchStore(config).close()
     with pytest.raises(ValueError, match="绑定"):
-        BatchStore(replace(config, obs_path="obs://other/"))
+        BatchStore(replace(config, source_dir=config.source_dir.parent / "other"))
 
 
 def test_progress_is_current_attempt_and_zero_when_stalled(config, batch_dir):

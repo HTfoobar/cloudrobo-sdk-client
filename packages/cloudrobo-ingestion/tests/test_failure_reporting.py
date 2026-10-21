@@ -144,7 +144,8 @@ def test_restart_rebuilds_unfinished_without_per_file_snapshots(
             == 0
         )
         columns = {row[1] for row in s.store.db.execute("PRAGMA table_info(batches)")}
-        assert not any("snapshot" in name for name in columns)
+        assert {name for name in columns if "snapshot" in name} == {"final_snapshot"}
+        assert s.store.get(batch["id"])["final_snapshot"] is None
     finally:
         s.store.close()
 

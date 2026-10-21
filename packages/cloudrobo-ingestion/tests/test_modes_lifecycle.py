@@ -168,7 +168,45 @@ def test_mock_initialization_cannot_modify_default_history(
     store.close()
     monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
     before = (config.work_dir / "batches.sqlite3").read_bytes()
-    with pytest.raises(ValueError, match="绑定模式"):
+    with pytest.raises(ValueError, match="绑定用途"):
         start(config_file, dict(run_mode="mock_report"))
     assert (config.work_dir / "batches.sqlite3").read_bytes() == before
     assert not (tmp_path / "runtime").exists()
+
+
+def test_detached_switches_real_modes_using_one_work_dir(config_file, tmp_path, monkeypatch):
+    from cloudrobo_ingestion.config import IngestionConfig
+    from cloudrobo_ingestion.store import BatchStore
+
+    monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("HUAWEI_CLOUD_AK", "test-ak")
+    monkeypatch.setenv("HUAWEI_CLOUD_SK", "test-sk")
+    config = IngestionConfig.load(config_file)
+    try:
+        start(config_file)
+        assert status()["run_mode"] == "upload_and_report"
+        stop()
+        # An empty batch exercises copy/success/cleanup without an OBS server.
+        batch = config.source_dir / "empty-batch"
+        batch.mkdir()
+        (batch / "__UPLOAD_READY__").touch()
+        pure = start(config_file, dict(run_mode="upload_only"))
+        assert pure["work_dir"] == str(config.work_dir)
+        wait_for(lambda: status().get("counts", {}).get("done") == 1)
+        stop()
+        start(config_file)
+        state = wait_for(lambda: status() if status().get("counts", {}).get("done") == 1 else None)
+        assert state["run_mode"] == "upload_and_report"
+        assert not state["reporter"]["pending_batches"]
+        stop()
+        store = BatchStore(config)
+        try:
+            row = store.rows()[0]
+            assert row["attempts"] == 1 and row["state"] == "done"
+            assert not row["report_enabled"]
+            assert row["pending"] is row["final_snapshot"] is None
+        finally:
+            store.close()
+    finally:
+        if running():
+            stop()
