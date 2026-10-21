@@ -585,13 +585,8 @@ def main(config_path, handshake, effective_path=None):
                         "endpoints", config.zenoh["endpoints"]
                     ),
                 )
-            if config.run_mode == "mock_report":
-                from .mock_runtime import MockRunner
-
-                supervisor = MockRunner(config, reporter, root / "status.json")
-            else:
-                stage = "database"
-                supervisor = Supervisor(config, reporter, root / "status.json")
+            stage = "database"
+            supervisor = Supervisor(config, reporter, root / "status.json")
             stage = "control"
             token = os.urandom(32)
             listener = Listener(("127.0.0.1", 0), authkey=token)

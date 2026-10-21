@@ -19,8 +19,6 @@ class BatchStore:
     def __init__(self, config):
         from .workspace import bind_mode
 
-        if not config.uploads:
-            raise ValueError("Mock 模式不使用真实批次数据库")
         bind_mode(config)
         self.db = sqlite3.connect(config.work_dir / "batches.sqlite3")
         self.db.row_factory = sqlite3.Row

@@ -59,10 +59,6 @@ def ingestion():
 @click.option("--zenoh-project-id", default=None)
 @click.option("--zenoh-device-id", default=None)
 @click.option("--zenoh-client-id", default=None)
-@click.option("--mock-file-count", type=int, default=None)
-@click.option("--mock-file-size-bytes", type=int, default=None)
-@click.option("--mock-upload-bps", type=float, default=None)
-@click.option("--mock-batch-interval-seconds", type=float, default=None)
 def start(config_path, **overrides):
     """启动后台目录监控。"""
     from . import lifecycle

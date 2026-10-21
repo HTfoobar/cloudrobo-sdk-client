@@ -26,7 +26,8 @@ jobs:
           -e packages/cloudrobo-workspace -e packages/cloudrobo-resource
           -e "packages/cloudrobo-r2c[client]"
           -e "packages/cloudrobo-ingestion[lerobot-validation]"
-      - name: Test ingestion and OBS compatibility
-        run: python -m pytest packages/cloudrobo-ingestion/tests packages/cloudrobo-core/tests -q
+          -e "tools/ingestion-mock[test]"
+      - name: Test ingestion, developer mock and distribution boundaries
+        run: python -m pytest packages/cloudrobo-ingestion/tests packages/cloudrobo-core/tests tools/ingestion-mock/tests -q
       - name: Lint ingestion
-        run: ruff check packages/cloudrobo-ingestion packages/cloudrobo-core/tests/test_obs_progress.py
+        run: ruff check packages/cloudrobo-ingestion tools/ingestion-mock packages/cloudrobo-core/tests/test_obs_progress.py

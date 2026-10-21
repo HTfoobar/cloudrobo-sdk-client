@@ -194,9 +194,14 @@ class Reporter:
     @staticmethod
     def _transport(path):
         from cloudrobo_r2c.common.config import ClientConfig
-        from cloudrobo_r2c.transport import ZenohTransport
 
         c = ClientConfig.from_yaml(path, None, None, None)
+        return Reporter.connect_transport(c)
+
+    @staticmethod
+    def connect_transport(c):
+        from cloudrobo_r2c.transport import ZenohTransport
+
         c.validate()
         t = ZenohTransport()
         try:

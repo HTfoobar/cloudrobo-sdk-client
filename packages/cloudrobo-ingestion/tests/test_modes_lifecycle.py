@@ -39,7 +39,7 @@ def install_import_guard(tmp_path, monkeypatch, condition):
     monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
 
 
-@pytest.mark.parametrize("run_mode", ["upload_only", "mock_report"])
+@pytest.mark.parametrize("run_mode", ["upload_only", "upload_and_report"])
 def test_real_child_receives_effective_cli_configuration(
     config_file, tmp_path, monkeypatch, run_mode
 ):
@@ -55,10 +55,6 @@ def test_real_child_receives_effective_cli_configuration(
             work_dir=str(work),
             task_type="CLI-task",
             collect_method="CLI-method",
-            mock_file_count=3,
-            mock_file_size_bytes=100,
-            mock_upload_bps=10,
-            mock_batch_interval_seconds=0,
             zenoh_endpoint=(unused_endpoint(),),
         ),
     )
@@ -68,15 +64,8 @@ def test_real_child_receives_effective_cli_configuration(
         assert not (tmp_path / "work").exists()
         state = wait_for(lambda: status() if status().get("run_mode") == run_mode else None)
         assert state["work_dir"] == str(work) and state["running"]
-        if run_mode == "mock_report":
-            state = wait_for(
-                lambda: status() if status().get("progress", {}).get("files") == 3 else None
-            )
-            assert state["mock"] and state["source_dir"] is None
-            assert not (work / "batches.sqlite3").exists()
-            assert not (work / "staging").exists() and not (work / "checkpoints").exists()
-        else:
-            assert state["reporter"]["enabled"] is False
+        assert state["reporter"]["enabled"] is (run_mode == "upload_and_report")
+        if run_mode == "upload_only":
             assert not list(work.glob("zenoh-*.yaml"))
         assert not list(work.glob("effective-*.json"))
         assert stop()["run_mode"] == run_mode
@@ -129,49 +118,6 @@ def test_detached_daemon_enforces_cli_file_limit(config_file, tmp_path, monkeypa
         assert config_file.read_bytes() == before
     finally:
         stop()
-
-
-def test_mock_daemon_does_not_access_obs_or_customer_source(config_file, tmp_path, monkeypatch):
-    install_import_guard(
-        tmp_path,
-        monkeypatch,
-        "name == 'obs' or name.startswith('obs.') or name.endswith('obs_client')",
-    )
-    monkeypatch.delenv("HUAWEI_CLOUD_AK", raising=False)
-    monkeypatch.delenv("HUAWEI_CLOUD_SK", raising=False)
-    data = yaml.safe_load(config_file.read_text())
-    data.update(
-        run_mode="mock_report",
-        source_dir=str(tmp_path / "nonexistent-source"),
-        zenoh=dict(endpoints=[unused_endpoint()]),
-    )
-    config_file.write_text(yaml.safe_dump(data))
-    start(config_file)
-    try:
-        s = wait_for(lambda: status() if status().get("progress", {}).get("files") else None)
-        assert s["mock"] and s["run_mode"] == "mock_report" and s["source_dir"] is None
-        work = tmp_path / "work"
-        assert not (work / "batches.sqlite3").exists() and not (work / "staging").exists()
-        assert not (tmp_path / "nonexistent-source").exists()
-    finally:
-        stop()
-
-
-def test_mock_initialization_cannot_modify_default_history(
-    config, config_file, tmp_path, monkeypatch
-):
-    from cloudrobo_ingestion.store import BatchStore
-
-    store = BatchStore(config)
-    b = store.add("completed", config)
-    store.update(b["id"], state="done", pending=b"durable-real-final")
-    store.close()
-    monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
-    before = (config.work_dir / "batches.sqlite3").read_bytes()
-    with pytest.raises(ValueError, match="绑定用途"):
-        start(config_file, dict(run_mode="mock_report"))
-    assert (config.work_dir / "batches.sqlite3").read_bytes() == before
-    assert not (tmp_path / "runtime").exists()
 
 
 def test_detached_switches_real_modes_using_one_work_dir(config_file, tmp_path, monkeypatch):

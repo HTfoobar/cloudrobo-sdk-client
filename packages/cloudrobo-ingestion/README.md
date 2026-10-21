@@ -13,14 +13,12 @@
 |---|---|---|---|
 | upload_and_report（默认） | 真实上传 | 每秒真实进度 | [ingestion.yaml](examples/ingestion.yaml) |
 | upload_only | 真实上传 | 未启用 | [upload-only.yaml](examples/upload-only.yaml) |
-| mock_report | 不上传 | 每秒模拟进度 | [mock.yaml](examples/mock.yaml) |
 
-旧配置未设置 `run_mode` 时保持默认行为。三个模式仍共享用户级单实例控制，
-同一时刻仅运行一个。默认模式和仅上传模式共用工作目录及成功记录；Mock 必须使用独立目录。
+旧配置未设置 `run_mode` 时保持默认行为。两种模式共享用户级单实例控制，
+同一时刻仅运行一个。默认模式和仅上传模式共用工作目录及成功记录。
 
 ```bash
 cloudrobo ingestion start --config upload-only.yaml
-cloudrobo ingestion start --config mock.yaml
 # 切换真实上传模式：先停止，再使用同一配置和工作目录启动
 cloudrobo ingestion stop
 cloudrobo ingestion start --config ingestion.yaml --run-mode upload_only
@@ -55,8 +53,7 @@ python -c 'from cloudrobo_r2c._build_commands import compile_protobuf_files; com
 
 默认模式下源目录、工作目录、OBS URI、`task_type` 和 `collect_method` 必填。
 只上传模式允许省略两个分类字段，并忽略不使用的 Zenoh 配置；提供分类时仍校验。
-Mock 模式不需要源目录或 OBS 凭证，工作目录及两个分类必填。分类必须为长度
-1～64 的字符串（按 Unicode 字符计数）。
+分类必须为长度 1～64 的字符串（按 Unicode 字符计数）。
 配置中的源/工作相对目录按原配置文件位置解释；CLI 路径按当前工作目录解释。
 Windows 推荐使用 `C:/data/source` 或单引号路径。
 OBS 使用现有 `cloudrobo config`、`HUAWEI_CLOUD_AK`、`HUAWEI_CLOUD_SK`、
@@ -83,7 +80,6 @@ connect 和 publisher 选项；身份不允许包含 `/` 或通配符。默认 B
 | Zenoh 通信模式 | `--zenoh-mode` |
 | 地址列表 | 可重复的 `--zenoh-endpoint` |
 | 身份 | `--zenoh-project-id`、`--zenoh-device-id`、`--zenoh-client-id` |
-| Mock 参数 | `--mock-file-count`、`--mock-file-size-bytes`、`--mock-upload-bps`、`--mock-batch-interval-seconds` |
 
 CLI 地址整体替换 `zenoh.endpoints` 和实际的 `zenoh.connect.endpoints`，
 保留 connect 超时等其他项。TLS、publisher 等高级设置只通过 YAML 配置。
@@ -116,7 +112,7 @@ LeRobot V3 应在 `finalize()` 完成后于整个数据集根目录创建标记�
 每批默认最多 **100** 个普通文件，通过顶层 `max_files_per_batch` 配置，或使用
 `--max-files-per-batch` 覆盖。该值必须为正整数，不接受布尔值、字符串或小数，
 没有固定的 5,000 上限。例如 `max_files_per_batch: 5000` 可允许一批 5,000 个文件。
-此限制适用于两个真实上传模式；Mock 继续使用 `mock.file_count` 控制模拟文件数量。
+此限制适用于两个真实上传模式。
 初次扫描、重试和复制复查均使用当前有效上限，超限拒绝整个批次，不复制、不上传。
 源目录只读，禁止
 源目录与工作目录重叠、符号链接或 Windows junction。复制完成且可选校验通过后
@@ -125,7 +121,7 @@ LeRobot V3 应在 `finalize()` 完成后于整个数据集根目录创建标记�
 ## 恢复和结果
 
 真实上传模式的工作目录包含 `mode.json`、`batches.sqlite3`、`staging/`、
-`checkpoints/` 和轮转日志。`mode.json` 绑定用途（真实上传或 Mock），两种真实模式可以复用。
+`checkpoints/` 和轮转日志。`mode.json` 标识真实上传工作目录，两种真实模式可以复用。
 当前功能尚未上线，本次不兼容旧工作目录结构；旧测试目录需要更换为新的空目录，
 不提供迁移脚本。新结构建立后可持续共享上传历史。
 数据库保存批次记录及必要的一次性最终补报结果，不保存逐秒快照或逐文件恢复进度；
@@ -249,20 +245,11 @@ Get-Content 'C:\data\ingestion-work\ingestion.log' -Tail 100 -Wait
 不自动修复、不逐帧解码、不评判训练质量；不支持 Lance 和内嵌 image 特征。
 校验副本失败不上传、清理副本、记录拒绝原因。关闭校验可上传其他普通数据格式。
 
-## Mock 模拟
+## 开发自测
 
-Mock 不扫描源目录、不复制数据、不调用 OBS、不创建真实批次数据库或 checkpoint。
-自动生成虚拟 MP4 文件，每轮包含新的批次 UUID、入队时间、模拟目标子目录及文件
-UUID；顺序模拟 queued/uploading/done、进度、速率和 ETA，每秒发布全量消息。
-
-默认 10 个文件、每个 10 MiB、速率 2 MiB/s，批次间隔 5 秒。文件数为整数
-1～5,000，文件大小为 int64 范围内的正整数，速率为有限正数，间隔为有限非负数。
-完成消息发布调用成功后才进入下一轮；router 不可用时只保留当前批次最新状态，
-不会无限生成历史。模拟记录仅在内存中，重启从新批次开始。
-
-使用真实本地 Zenoh 和同一 `r2c/local` 身份及 topic；协议没有 Mock 标志，
-下游会按普通进度消息处理。CLI/status/log 明确显示 `mock_report`。
-Mock 不支持 LeRobot 校验，配置开启时会报错；可用 `--no-validate-lerobot` 覆盖。
+Mock 已移至独立前台开发入口，不属于客户运行模式，也不接受客户配置中的
+`mock` 或 `run_mode: mock_report`。场景、参数和云端验收步骤见
+[开发测试说明](../../tools/ingestion-mock/README.md)。
 
 ## 平台与验收
 
@@ -271,7 +258,7 @@ loopback 控制通道。每个操作系统用户单实例，控制登记在 `~/.
 `CLOUDROBO_INGESTION_RUNTIME_DIR` 可指定独立登记位置（主要用于测试/受管理部署）；
 不同登记目录会形成独立实例域。工作目录应由该用户独占，不要手动修改 SQLite。
 
-跨平台 mock CI 与真实 OBS/router 联调分开。性能验收需在目标机器人及客户实际
+跨平台自动化 CI 与真实 OBS/router 联调分开。性能验收需在目标机器人及客户实际
 数据上测量：单个 5,000 文件批次运行 30 分钟，序列化 p95 ≤200 ms、发布间隔
 p95 ≤1.2 秒、OBS 吞吐相对关闭上报下降 ≤5%。通过单元测试不代表满足这些指标。
 
