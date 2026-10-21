@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from .filesystem import DEFAULT_MAX_FILES_PER_BATCH
+
 RUN_MODES = ("upload_and_report", "upload_only", "mock_report")
 MOCK_DEFAULTS = dict(
     file_count=10, file_size_bytes=10485760, upload_bps=2097152, batch_interval_seconds=5
@@ -21,6 +23,7 @@ OVERRIDE_PATHS = {
     "obs_path": ("obs_path",),
     "task_type": ("task_type",),
     "collect_method": ("collect_method",),
+    "max_files_per_batch": ("max_files_per_batch",),
     "validation_enabled": ("validation", "enabled"),
     "zenoh_mode": ("zenoh", "mode"),
     "zenoh_project_id": ("zenoh", "project_id"),
@@ -83,6 +86,7 @@ class IngestionConfig:
     zenoh: dict = field(default_factory=dict)
     run_mode: str = "upload_and_report"
     mock: dict = field(default_factory=lambda: dict(MOCK_DEFAULTS))
+    max_files_per_batch: int = DEFAULT_MAX_FILES_PER_BATCH
 
     @property
     def uploads(self):
@@ -106,6 +110,11 @@ class IngestionConfig:
         if mode not in RUN_MODES:
             raise ValueError(f"run_mode 必须为 {', '.join(RUN_MODES)}")
         uploads, reports = mode != "mock_report", mode != "upload_only"
+        max_files = DEFAULT_MAX_FILES_PER_BATCH
+        if uploads:
+            max_files = data.get("max_files_per_batch", DEFAULT_MAX_FILES_PER_BATCH)
+            if type(max_files) is not int or max_files <= 0:
+                raise ValueError("max_files_per_batch 必须是正整数")
         for key in ("work_dir",) + (("source_dir", "obs_path") if uploads else ()):
             if not isinstance(data.get(key), str) or not data[key]:
                 raise ValueError(f"{key} 必须是非空字符串")
@@ -218,6 +227,7 @@ class IngestionConfig:
             z,
             mode,
             mock,
+            max_files,
         )
 
     def to_mapping(self):
@@ -230,6 +240,8 @@ class IngestionConfig:
         )
         if self.source_dir is not None:
             result["source_dir"] = str(self.source_dir)
+        if self.uploads:
+            result["max_files_per_batch"] = self.max_files_per_batch
         if self.reports or self.task_type:
             result["task_type"] = self.task_type
         if self.reports or self.collect_method:

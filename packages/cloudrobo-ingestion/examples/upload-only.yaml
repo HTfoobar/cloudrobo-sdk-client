@@ -2,6 +2,7 @@ run_mode: upload_only
 source_dir: ./customer-data
 work_dir: ./ingestion-upload-work
 obs_path: obs://customer-bucket/robot-data/
+max_files_per_batch: 100
 validation:
   enabled: false
   format: lerobot_v3

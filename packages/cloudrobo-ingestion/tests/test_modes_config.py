@@ -17,6 +17,49 @@ def update(path, **values):
     path.write_text(yaml.safe_dump(data))
 
 
+@pytest.mark.parametrize("mode", ["upload_and_report", "upload_only"])
+@pytest.mark.parametrize("value", [None, True, False, "100", 1.5, 0, -1])
+def test_invalid_batch_file_limit(config_file, mode, value):
+    update(config_file, run_mode=mode, max_files_per_batch=value)
+    with pytest.raises(ValueError, match="max_files_per_batch"):
+        IngestionConfig.load(config_file)
+
+
+def test_batch_file_limit_priority_and_effective_config(config_file):
+    assert IngestionConfig.load(config_file).max_files_per_batch == 100
+    update(config_file, max_files_per_batch=5001)
+    assert (
+        IngestionConfig.load(config_file, dict(max_files_per_batch=None)).max_files_per_batch
+        == 5001
+    )
+    c = IngestionConfig.load(config_file, dict(max_files_per_batch=200))
+    assert c.max_files_per_batch == 200
+    assert IngestionConfig.from_mapping(c.to_mapping(), config_file.parent) == c
+    assert yaml.safe_load(config_file.read_text())["max_files_per_batch"] == 5001
+
+
+@pytest.mark.parametrize("limit", ["1", "5001", "0", "-1"])
+def test_cli_batch_file_limit(config_file, monkeypatch, limit):
+    from cloudrobo_ingestion import lifecycle
+
+    received = []
+
+    def start(path, overrides=None):
+        received.append(IngestionConfig.load(path, overrides))
+        return dict(pid=123, work_dir="work", run_mode="upload_and_report")
+
+    monkeypatch.setattr(lifecycle, "start", start)
+    result = CliRunner().invoke(
+        ingestion, ["start", "--config", str(config_file), "--max-files-per-batch", limit]
+    )
+    if int(limit) > 0:
+        assert result.exit_code == 0, result.output
+        assert received[0].max_files_per_batch == int(limit)
+    else:
+        assert result.exit_code != 0
+        assert not received
+
+
 def test_legacy_config_defaults_to_combined(config_file):
     c = IngestionConfig.load(config_file)
     assert c.run_mode == "upload_and_report" and c.uploads and c.reports
@@ -207,6 +250,7 @@ def test_cli_absent_flags_preserve_config(config_file, monkeypatch):
     assert result.exit_code == 0, result.output
     assert captured[0]["validation_enabled"] is None
     assert captured[0]["run_mode"] is None
+    assert captured[0]["max_files_per_batch"] is None
     assert captured[0]["zenoh_endpoint"] == ()
 
 

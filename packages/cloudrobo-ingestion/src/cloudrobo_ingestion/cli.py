@@ -22,6 +22,7 @@ def ingestion():
 @click.option("--obs-path", default=None)
 @click.option("--task-type", default=None)
 @click.option("--collect-method", default=None)
+@click.option("--max-files-per-batch", type=click.IntRange(min=1), default=None)
 @click.option("--validate-lerobot/--no-validate-lerobot", "validation_enabled", default=None)
 @click.option("--zenoh-mode", type=click.Choice(["client", "peer"]), default=None)
 @click.option("--zenoh-endpoint", multiple=True)

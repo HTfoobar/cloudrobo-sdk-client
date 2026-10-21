@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MARKER = "__UPLOAD_READY__"
-MAX_FILES = 5000
+DEFAULT_MAX_FILES_PER_BATCH = 100
 
 
 class RejectedBatch(ValueError):
@@ -41,15 +41,15 @@ def _walk(root: Path):
 
 
 def discover(root: Path):
-    """Yield outer marker directories; nested batches are rejected by manifest()."""
+    """Only direct children of source_dir can be ready batches."""
     if is_link(root):
         raise RejectedBatch("source_dir 不允许链接或 junction")
-    for current, dirs, files in os.walk(root, followlinks=False):
-        base = Path(current)
-        dirs[:] = sorted(d for d in dirs if not is_link(base / d))
-        if MARKER in files:
-            yield base
-            dirs.clear()
+    for child in sorted(root.iterdir()):
+        if is_link(child) or not child.is_dir():
+            continue
+        marker = child / MARKER
+        if marker.exists() or marker.is_symlink():
+            yield child
 
 
 @dataclass(frozen=True)
@@ -60,14 +60,12 @@ class FileEntry:
     inode: int
 
 
-def manifest(root: Path) -> list[FileEntry]:
+def manifest(root: Path, max_files: int = DEFAULT_MAX_FILES_PER_BATCH) -> list[FileEntry]:
     marker = root / MARKER
     if is_link(marker) or not marker.is_file() or marker.stat().st_size:
         raise RejectedBatch("__UPLOAD_READY__ 必须是空的普通文件")
     entries = []
     for base, _, files in _walk(root):
-        if base != root and MARKER in files:
-            raise RejectedBatch("批次目录不能嵌套")
         for name in sorted(files):
             if name == MARKER:
                 continue
@@ -78,12 +76,18 @@ def manifest(root: Path) -> list[FileEntry]:
             entries.append(
                 FileEntry(p.relative_to(root).as_posix(), s.st_size, s.st_mtime_ns, s.st_ino)
             )
-            if len(entries) > MAX_FILES:
-                raise RejectedBatch(f"批次文件数超过 {MAX_FILES}")
+            if len(entries) > max_files:
+                raise RejectedBatch(f"批次文件数超过配置上限 {max_files}")
     return sorted(entries, key=lambda x: x.path)
 
 
-def checked_copy(source: Path, target: Path, entries: list[FileEntry], stop) -> None:
+def checked_copy(
+    source: Path,
+    target: Path,
+    entries: list[FileEntry],
+    stop,
+    max_files: int = DEFAULT_MAX_FILES_PER_BATCH,
+) -> None:
     target.mkdir(parents=True, exist_ok=False)
     for entry in entries:
         if stop.is_set():
@@ -108,7 +112,7 @@ def checked_copy(source: Path, target: Path, entries: list[FileEntry], stop) -> 
             after = os.fstat(f.fileno())
             if (after.st_size, after.st_mtime_ns) != (entry.size, entry.mtime_ns):
                 raise RejectedBatch(f"复制期间源文件变化: {entry.path}")
-    if manifest(source) != entries:
+    if manifest(source, max_files) != entries:
         raise RejectedBatch("复制期间源目录内容变化")
 
 

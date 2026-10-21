@@ -78,7 +78,13 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
             return
         stage = "copying"
         log("INFO", "Copying batch", files=len(entries))
-        checked_copy(config.source_dir / batch["path"], staging, entries, stop)
+        checked_copy(
+            config.source_dir / batch["path"],
+            staging,
+            entries,
+            stop,
+            max_files=config.max_files_per_batch,
+        )
         if config.validation_enabled:
             stage = "validating"
             send("phase", state="validating")

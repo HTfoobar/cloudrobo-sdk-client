@@ -74,6 +74,7 @@ connect 和 publisher 选项；身份不允许包含 `/` 或通配符。默认 B
 | 运行模式 | `--run-mode` |
 | 路径 | `--source-dir`、`--work-dir`、`--obs-path` |
 | 分类 | `--task-type`、`--collect-method` |
+| 每批文件数上限 | `--max-files-per-batch` |
 | 校验开关 | `--validate-lerobot` / `--no-validate-lerobot` |
 | Zenoh 通信模式 | `--zenoh-mode` |
 | 地址列表 | 可重复的 `--zenoh-endpoint` |
@@ -87,18 +88,33 @@ CLI 地址整体替换 `zenoh.endpoints` 和实际的 `zenoh.connect.endpoints`�
 
 ```text
 source/
+  __UPLOAD_READY__         # 忽略，不上传 source 本身
   batch-001/
     __UPLOAD_READY__       # 所有写入关闭后，最后创建的空文件
     meta/...
     data/...
     videos/...
+    nested/
+      __UPLOAD_READY__     # 忽略，不单独触发任务，也不上传标记
+      data.parquet         # 随 batch-001 上传
+  unmarked/
+    nested/
+      __UPLOAD_READY__     # 不触发上传，unmarked 缺少直接标记
 ```
 
-每 2 秒递归发现就绪目录。标记创建后目录必须保持不变，批次不可嵌套、路径不可复用。
+每 2 秒仅检查源目录的直接子目录，只有直接子目录中的空标记才触发整个子目录上传。
+源目录根部和更深层的标记不触发任务，也不会导致嵌套批次报错。
+有效批次内部仍递归收集普通数据文件，所有层级的标记均不复制、不上传、不计数。
+标记创建后目录必须保持不变，批次路径不可复用。
 LeRobot V3 应在 `finalize()` 完成后于整个数据集根目录创建标记，不要仅标记 data
 或 videos 子目录。无标记目录不会上传。
 
-每批最多 5,000 个普通文件，不计标记；超限会拒绝整个批次。源目录只读，禁止
+每批默认最多 **100** 个普通文件，通过顶层 `max_files_per_batch` 配置，或使用
+`--max-files-per-batch` 覆盖。该值必须为正整数，不接受布尔值、字符串或小数，
+没有固定的 5,000 上限。例如 `max_files_per_batch: 5000` 可允许一批 5,000 个文件。
+此限制适用于两个真实上传模式；Mock 继续使用 `mock.file_count` 控制模拟文件数量。
+初次扫描、重试和复制复查均使用当前有效上限，超限拒绝整个批次，不复制、不上传。
+源目录只读，禁止
 源目录与工作目录重叠、符号链接或 Windows junction。复制完成且可选校验通过后
 才开始上传，OBS 保留相对源目录结构，标记不上传，本地删除不会删除 OBS 对象。
 

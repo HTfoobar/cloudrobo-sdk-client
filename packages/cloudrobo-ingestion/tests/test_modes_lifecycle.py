@@ -105,6 +105,32 @@ def test_pure_daemon_without_reporting_imports(config_file, tmp_path, monkeypatc
         stop()
 
 
+def test_detached_daemon_enforces_cli_file_limit(config_file, tmp_path, monkeypatch):
+    monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("HUAWEI_CLOUD_AK", "test-ak")
+    monkeypatch.setenv("HUAWEI_CLOUD_SK", "test-sk")
+    monkeypatch.setenv("CLOUDROBO_OBS_ENDPOINT", "http://127.0.0.1:1")
+    batch = tmp_path / "source/batch"
+    batch.mkdir()
+    (batch / "__UPLOAD_READY__").touch()
+    (batch / "first.txt").write_text("first")
+    (batch / "second.txt").write_text("second")
+    data = yaml.safe_load(config_file.read_text())
+    data["max_files_per_batch"] = 10
+    config_file.write_text(yaml.safe_dump(data))
+    before = config_file.read_bytes()
+    start(config_file, dict(run_mode="upload_only", max_files_per_batch=1))
+    try:
+        state = wait_for(
+            lambda: status() if status().get("counts", {}).get("rejected") == 1 else None
+        )
+        assert "配置上限 1" in state["batch_errors"][0]["error"]
+        assert not list((tmp_path / "work/staging").iterdir())
+        assert config_file.read_bytes() == before
+    finally:
+        stop()
+
+
 def test_mock_daemon_does_not_access_obs_or_customer_source(config_file, tmp_path, monkeypatch):
     install_import_guard(
         tmp_path,

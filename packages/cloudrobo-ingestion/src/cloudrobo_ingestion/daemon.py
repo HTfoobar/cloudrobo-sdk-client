@@ -72,7 +72,7 @@ class Supervisor:
             if batch["state"] in ("done", "rejected") or batch["id"] in self.progress:
                 continue
             try:
-                entries = manifest(source)
+                entries = manifest(source, self.config.max_files_per_batch)
                 progress = BatchProgress(batch, entries, self.source)
                 self.progress[batch["id"]] = progress
                 self.store.update(
@@ -115,7 +115,9 @@ class Supervisor:
             if batch["state"] == "done":
                 continue
             try:
-                entries = manifest(self.config.source_dir / batch["path"])
+                entries = manifest(
+                    self.config.source_dir / batch["path"], self.config.max_files_per_batch
+                )
             except RejectedBatch as exc:
                 self.store.update(batch["id"], state="rejected", error=str(exc), pending=None)
                 self.progress.pop(batch["id"], None)

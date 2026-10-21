@@ -1,5 +1,6 @@
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,8 @@ class Connection:
 
 
 @pytest.mark.parametrize("success", [True, False])
-def test_worker_obs_and_progress(config, batch_dir, monkeypatch, success):
+@pytest.mark.parametrize("file_count", [1, 101])
+def test_worker_obs_and_progress(config, batch_dir, monkeypatch, success, file_count):
     from cloudrobo_core.sdk import obs_client
 
     calls = []
@@ -46,16 +48,46 @@ def test_worker_obs_and_progress(config, batch_dir, monkeypatch, success):
             pass
 
     monkeypatch.setattr(obs_client, "OBSClient", OBS)
+    config = replace(config, max_files_per_batch=file_count)
+    for i in range(1, file_count):
+        (batch_dir / f"data/file-{i:03}.parquet").write_bytes(b"customer-data")
     store = BatchStore(config)
     batch = store.add("批次001", config)
     conn = Connection()
-    run_worker(config, batch, manifest(batch_dir), conn)
-    assert calls == ["prefix/批次001/data/file-000.parquet"]
+    entries = manifest(batch_dir, config.max_files_per_batch)
+    run_worker(config, batch, entries, conn)
+    expected = [f"prefix/批次001/{e.path}" for e in entries]
+    assert calls == (expected if success else expected[:1])
     result = [e for e in conn.messages if e["event"] == "result"][0]
     assert result["state"] == ("done" if success else "failed")
     assert any(e["event"] == "file" and e["state"] == 1 for e in conn.messages)
     assert (batch_dir / "data/file-000.parquet").read_bytes() == b"customer-data"
     store.close()
+
+
+@pytest.mark.parametrize("mode", ["upload_and_report", "upload_only"])
+def test_supervisor_checks_limit_on_discovery_and_before_upload(config, batch_dir, mode):
+    from cloudrobo_ingestion.progress import DisabledReporter
+
+    config = replace(config, run_mode=mode, max_files_per_batch=1)
+    reporter = Reporter("unused", config.topic) if config.reports else DisabledReporter()
+    s = Supervisor(config, reporter, config.work_dir / "status.json")
+    try:
+        # Initially within the limit; launch must recheck rather than trust scan.
+        s.scan()
+        assert len(s.progress) == 1
+        (batch_dir / "extra.parquet").touch()
+        s.launch_next()
+        assert s.process is None
+        assert s.store.rows()[0]["state"] == "rejected"
+        assert "配置上限 1" in s.store.rows()[0]["error"]
+        assert not list((config.work_dir / "staging").iterdir())
+        s.store.recover()
+        s.scan()
+        assert s.store.rows()[0]["state"] == "rejected"
+        assert not s.progress
+    finally:
+        s.store.close()
 
 
 def test_worker_reports_windows_error_with_stack_and_stage(config, batch_dir, monkeypatch):
@@ -93,7 +125,7 @@ def test_worker_reports_windows_error_with_stack_and_stage(config, batch_dir, mo
 def test_copy_failure_is_identified_before_obs_upload(config, batch_dir, monkeypatch):
     from cloudrobo_ingestion import worker
 
-    def fail_copy(*args):
+    def fail_copy(*args, **kwargs):
         raise PermissionError(13, "source cannot be read", str(batch_dir / "data/file-000.parquet"))
 
     monkeypatch.setattr(worker, "checked_copy", fail_copy)
@@ -119,6 +151,7 @@ def successful_child(config, batch, entries, connection, cleanup_only):
             config.work_dir / "staging" / batch["id"],
             entries,
             threading.Event(),
+            max_files=config.max_files_per_batch,
         )
         for e in entries:
             connection.send(dict(event="file", path=e.path, state=2, transferred=e.size))
