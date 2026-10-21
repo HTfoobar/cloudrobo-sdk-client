@@ -13,8 +13,9 @@ def redact(value, secrets=(), limit=2000):
         if isinstance(secret, str) and secret:
             text = text.replace(secret, "[REDACTED]")
     # SDK messages may contain signed URLs or request headers/XML.
-    text = re.sub(r"(https?://)[^/\s]+@", r"\1[REDACTED]@", text)
-    text = re.sub(r"(https?://[^\s?'\"<>]+)\?[^\s'\"<>]*", r"\1?[REDACTED]", text)
+    scheme = r"(?:https?://|(?:tcp|tls|udp|quic)/)"
+    text = re.sub(r"(" + scheme + r")[^/\s]+@", r"\1[REDACTED]@", text)
+    text = re.sub(r"(" + scheme + r"[^\s?'\"<>]+)\?[^\s'\"<>]*", r"\1?[REDACTED]", text)
     text = re.sub(r"(?im)(authorization\s*[:=]\s*).*", r"\1[REDACTED]", text)
     sensitive = r"(?:access[_-]?key(?:[_-]?id)?|secret[_-]?key|security[_-]?token|token|signature|password|ak|sk)"
     text = re.sub(
@@ -55,6 +56,19 @@ def exception_details(exc, secrets=()):
         dict(file=redact(f.filename, secrets), line=f.lineno, function=redact(f.name, secrets))
         for f in traceback.extract_tb(exc.__traceback__)[-20:]
     ]
+    cause = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    seen, causes = {id(exc)}, []
+    while cause is not None and id(cause) not in seen and len(causes) < 4:
+        seen.add(id(cause))
+        item = dict(exception_type=type(cause).__name__, message=redact(cause, secrets))
+        for name in ("errno", "winerror"):
+            value = getattr(cause, name, None)
+            if isinstance(value, int):
+                item[name] = value
+        causes.append(item)
+        cause = cause.__cause__ or (None if cause.__suppress_context__ else cause.__context__)
+    if causes:
+        details["causes"] = causes
     return details
 
 

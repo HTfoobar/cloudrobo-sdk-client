@@ -58,7 +58,7 @@ class OBSClient:
             )
             logger.info("OBS client initialized successfully")
         except Exception as e:
-            logger.error(f"OBS client initialization failed: {e}")
+            logger.error("OBS client initialization failed: %s", exception_details(e, credential_values(self)))
             raise
 
     def _resolve_endpoint(self) -> str:

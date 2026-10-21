@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import logging
 import queue
 import threading
 import time
@@ -10,7 +11,10 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
+from .diagnostics import DiagnosticError, ErrorTracker, log_error, make_error, summary
 from .store import now_ms
+
+logger = logging.getLogger(__name__)
 
 
 def message_class():
@@ -132,7 +136,7 @@ class BatchProgress:
 class Reporter:
     """One slot per batch. Never run transport calls in the upload/control loop."""
 
-    def __init__(self, config_path, topic, factory=None, interval=1.0):
+    def __init__(self, config_path, topic, factory=None, interval=1.0, endpoints=None):
         self.config_path, self.topic, self.interval = config_path, topic, interval
         self.factory = factory or self._transport
         self.lock = threading.Lock()
@@ -141,6 +145,9 @@ class Reporter:
         self.stop_event = threading.Event()
         self.wake = threading.Event()
         self.status = {"connected": False, "last_published_ms": 0, "error": ""}
+        self.endpoints = list(endpoints or [])
+        self.errors = ErrorTracker(logger)
+        self.serialization_errors = {}
         self.thread = threading.Thread(target=self._run, name="ingestion-reporter", daemon=True)
 
     @staticmethod
@@ -153,9 +160,19 @@ class Reporter:
         t = ZenohTransport()
         try:
             t.connect(c)
-        except Exception:
-            t.close()
-            raise
+        except Exception as exc:
+            info = make_error(
+                "report",
+                "connect",
+                exc,
+                diagnostic=getattr(exc, "connection_info", lambda: {})(),
+                context=dict(endpoints=c.connect.endpoints if c.connect else c.endpoints),
+            )
+            try:
+                t.close()
+            except Exception as close_exc:
+                log_error(logger, make_error("report", "close", close_exc), logging.WARNING)
+            raise DiagnosticError(info) from exc
         return t
 
     def set(self, batch_id, snapshot, terminal=False):
@@ -166,10 +183,23 @@ class Reporter:
     def remove(self, batch_id):
         with self.lock:
             self.slots.pop(batch_id, None)
+            tracker = self.serialization_errors.pop(batch_id, None)
+            if tracker:
+                tracker.recovered()
 
     def diagnostics(self):
         with self.lock:
-            return dict(self.status, enabled=True, pending_batches=len(self.slots))
+            errors = ([self.errors.info] if self.errors.info else []) + [
+                t.info for t in self.serialization_errors.values() if t.info
+            ]
+            return dict(
+                self.status,
+                enabled=True,
+                pending_batches=len(self.slots),
+                error=summary(errors[0]) if errors else "",
+                error_info=errors[0] if errors else None,
+                errors=errors,
+            )
 
     def _run(self):
         transport = None
@@ -188,41 +218,90 @@ class Reporter:
                 if not slots:
                     self.stop_event.wait(0.1)
                     continue
+                payloads = []
+                for batch_id, slot in slots.items():
+                    snapshot, terminal = slot
+                    try:
+                        payload = snapshot if isinstance(snapshot, bytes) else snapshot.serialize()
+                        payloads.append((batch_id, slot, payload, terminal))
+                        with self.lock:
+                            tracker = self.serialization_errors.pop(batch_id, None)
+                            if tracker:
+                                tracker.recovered()
+                    except Exception as exc:
+                        info = make_error(
+                            "local",
+                            "serialize",
+                            exc,
+                            context=dict(batch_id=batch_id, topic=self.topic),
+                        )
+                        with self.lock:
+                            # An obsolete snapshot must not resurrect a removed error.
+                            if self.slots.get(batch_id) is slot:
+                                self.serialization_errors.setdefault(
+                                    batch_id, ErrorTracker(logger)
+                                ).failed(info)
+                if not payloads:
+                    continue
+                stage = "connect"
                 try:
                     if transport is None:
                         transport = self.factory(self.config_path)
-                    for batch_id, slot in slots.items():
+                    stage = "publish"
+                    for batch_id, slot, payload, terminal in payloads:
                         if self.stop_event.is_set():
                             break
                         connection_info = getattr(transport, "connection_info", lambda: None)()
                         if connection_info and connection_info.get("connected") is False:
                             raise ConnectionError("Zenoh link disconnected")
-                        snapshot, terminal = slot
-                        payload = snapshot if isinstance(snapshot, bytes) else snapshot.serialize()
                         transport.publish(self.topic, payload)
                         with self.lock:
+                            self.errors.recovered()
                             self.status.update(connected=True, last_published_ms=now_ms(), error="")
                             if terminal and self.slots.get(batch_id) is slot:
                                 self.slots.pop(batch_id)
                         self.acks.put((batch_id, payload))
                     retry_at = 0
                 except Exception as exc:
-                    # Safe diagnostics; endpoints/credentials are not copied into local status.
+                    info = (
+                        exc.info
+                        if isinstance(exc, DiagnosticError)
+                        else make_error(
+                            "report",
+                            stage,
+                            exc,
+                            diagnostic=getattr(transport, "connection_info", lambda: {})()
+                            if transport
+                            else None,
+                            context=dict(endpoints=self.endpoints, topic=self.topic),
+                        )
+                    )
+                    info["context"].setdefault("topic", self.topic)
+                    info["context"].setdefault("endpoints", self.endpoints)
                     with self.lock:
-                        self.status.update(connected=False, error=type(exc).__name__)
+                        self.errors.failed(info)
+                        self.status.update(connected=False)
                     if transport:
                         try:
                             transport.close()
-                        except Exception:
-                            pass
+                        except Exception as close_exc:
+                            log_error(
+                                logger, make_error("report", "close", close_exc), logging.WARNING
+                            )
                     transport = None
                     retry_at = time.monotonic() + 2
+        except Exception as exc:
+            with self.lock:
+                self.status.update(connected=False)
+                self.errors.failed(
+                    make_error("local", "runtime", exc, context=dict(thread="ingestion-reporter"))
+                )
         finally:
             if transport:
                 try:
                     transport.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(logger, make_error("report", "close", exc), logging.WARNING)
 
     def start(self):
         self.thread.start()
@@ -258,4 +337,6 @@ class DisabledReporter:
             pending_batches=0,
             last_published_ms=0,
             error="",
+            error_info=None,
+            errors=[],
         )

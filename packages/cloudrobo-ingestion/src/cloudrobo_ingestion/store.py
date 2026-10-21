@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 import uuid
@@ -28,7 +29,8 @@ class BatchStore:
                 id TEXT PRIMARY KEY, path TEXT UNIQUE NOT NULL, asset_path TEXT NOT NULL,
                 timestamp INTEGER NOT NULL, task_type TEXT NOT NULL, collect_method TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
-                retry_at REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+                retry_at REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', error_info TEXT,
+                cleanup_error_info TEXT,
                 cleanup_pending INTEGER NOT NULL DEFAULT 0, pending BLOB,
                 files INTEGER NOT NULL DEFAULT 0, bytes INTEGER NOT NULL DEFAULT 0
             );
@@ -60,13 +62,27 @@ class BatchStore:
                     config.collect_method,
                 ),
             )
-        return dict(self.db.execute("SELECT * FROM batches WHERE path=?", (path,)).fetchone())
+        return self._decode(
+            self.db.execute("SELECT * FROM batches WHERE path=?", (path,)).fetchone()
+        )
 
     def get(self, batch_id):
-        return dict(self.db.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone())
+        return self._decode(
+            self.db.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        )
+
+    @staticmethod
+    def _decode(row):
+        result = dict(row)
+        for key in ("error_info", "cleanup_error_info"):
+            result[key] = json.loads(result[key]) if result[key] else None
+        return result
 
     def rows(self):
-        return [dict(r) for r in self.db.execute("SELECT * FROM batches ORDER BY timestamp,path")]
+        return [
+            self._decode(r)
+            for r in self.db.execute("SELECT * FROM batches ORDER BY timestamp,path")
+        ]
 
     def update(self, batch_id, **values):
         allowed = {
@@ -74,6 +90,8 @@ class BatchStore:
             "attempts",
             "retry_at",
             "error",
+            "error_info",
+            "cleanup_error_info",
             "cleanup_pending",
             "pending",
             "files",
@@ -81,6 +99,9 @@ class BatchStore:
         }
         if not values.keys() <= allowed:
             raise ValueError("Invalid batch update")
+        for key in ("error_info", "cleanup_error_info"):
+            if values.get(key) is not None:
+                values[key] = json.dumps(values[key], ensure_ascii=False)
         with self.db:
             self.db.execute(
                 "UPDATE batches SET " + ",".join(f"{k}=?" for k in values) + " WHERE id=?",

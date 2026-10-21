@@ -10,6 +10,7 @@ import multiprocessing
 import os
 import queue
 import signal
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -21,6 +22,7 @@ from pathlib import Path
 import yaml
 
 from .config import IngestionConfig
+from .diagnostics import DiagnosticError, log_error, make_error, summary
 from .filesystem import RejectedBatch, discover, manifest, remove_staging
 from .lifecycle import InstanceLock, private_dir, runtime_dir, write_json
 from .progress import BatchProgress, DisabledReporter, Reporter, message_class
@@ -44,17 +46,52 @@ class Supervisor:
         self.active = self.result = None
         self.cleanup_only = False
         self.last_error = ""
+        self.error_info = None
         self.context = multiprocessing.get_context("spawn")
+
+    def batch_error(self, batch, info, *, cleanup=False, **updates):
+        if cleanup:
+            updates["cleanup_error_info"] = info
+        else:
+            updates.update(error=summary(info), error_info=info)
+        self.store.update(batch["id"], **updates)
+        log_error(logger, info)
+
+    def batch_failure(self, batch, stage, exc, **updates):
+        self.batch_error(
+            batch,
+            make_error(
+                "local",
+                stage,
+                exc,
+                context=dict(
+                    batch_id=batch["id"],
+                    batch_path=batch["path"],
+                    source_dir=str(self.config.source_dir),
+                ),
+            ),
+            **updates,
+        )
 
     def cleanup(self, batch):
         try:
             remove_staging(self.config.work_dir / "staging" / batch["id"])
             pending = (self.config.work_dir / "checkpoints" / f"{batch['id']}.json").exists()
             self.store.update(batch["id"], cleanup_pending=int(pending))
+            if not pending and batch.get("cleanup_error_info"):
+                logger.info("异常已恢复：%s", summary(batch["cleanup_error_info"]))
+                self.store.update(batch["id"], cleanup_error_info=None)
             return not pending
         except Exception as exc:
-            self.last_error = f"工作副本清理失败: {batch['path']} ({type(exc).__name__})"
-            self.store.update(batch["id"], cleanup_pending=1, error=self.last_error)
+            info = make_error(
+                "local",
+                "cleanup",
+                exc,
+                context=dict(
+                    batch_id=batch["id"], path=str(self.config.work_dir / "staging" / batch["id"])
+                ),
+            )
+            self.batch_error(batch, info, cleanup=True, cleanup_pending=1)
             return False
 
     def initialize(self):
@@ -80,14 +117,15 @@ class Supervisor:
                 )
                 self.reporter.set(batch["id"], progress)
             except RejectedBatch as exc:
-                self.store.update(batch["id"], state="rejected", error=str(exc), pending=None)
+                self.batch_failure(batch, "scan", exc, state="rejected", pending=None)
                 self.reporter.remove(batch["id"])
             except OSError as exc:
-                self.store.update(
-                    batch["id"],
+                self.batch_failure(
+                    batch,
+                    "scan",
+                    exc,
                     state="failed",
                     retry_at=time.time() + 5,
-                    error=f"源目录读取失败: {type(exc).__name__}",
                 )
 
     @property
@@ -119,16 +157,17 @@ class Supervisor:
                     self.config.source_dir / batch["path"], self.config.max_files_per_batch
                 )
             except RejectedBatch as exc:
-                self.store.update(batch["id"], state="rejected", error=str(exc), pending=None)
+                self.batch_failure(batch, "scan", exc, state="rejected", pending=None)
                 self.progress.pop(batch["id"], None)
                 self.reporter.remove(batch["id"])
                 continue
             except OSError as exc:
-                self.store.update(
-                    batch["id"],
+                self.batch_failure(
+                    batch,
+                    "scan",
+                    exc,
                     state="failed",
                     retry_at=time.time() + 5,
-                    error=f"源目录读取失败: {type(exc).__name__}",
                 )
                 continue
             p = BatchProgress(batch, entries, self.source)
@@ -142,7 +181,6 @@ class Supervisor:
                 bytes=sum(e.size for e in entries),
                 pending=None,
                 cleanup_pending=1,
-                error="",
             )
             self._launch(batch, entries)
             return
@@ -158,13 +196,10 @@ class Supervisor:
         )
         try:
             self.process.start()
-        except Exception:
+        except Exception as exc:
             parent.close()
             self.process = self.pipe = None
-            self.store.update(
-                batch["id"], state="failed", retry_at=time.time() + 5, error="上传子进程启动失败"
-            )
-            raise
+            self.batch_failure(batch, "worker_start", exc, state="failed", retry_at=time.time() + 5)
         finally:
             child.close()
 
@@ -192,8 +227,19 @@ class Supervisor:
                         )
                     elif kind in ("result", "cleaned"):
                         self.result = event
-            except (EOFError, OSError):
+                    elif kind == "cleanup_error":
+                        self.batch_error(
+                            self.store.get(self.active),
+                            event["error_info"],
+                            cleanup=True,
+                            cleanup_pending=1,
+                        )
+            except EOFError:
                 pass
+            except OSError as exc:
+                raise DiagnosticError(
+                    make_error("local", "ipc", exc, context=dict(batch_id=self.active))
+                ) from exc
 
     def drain(self):
         self._drain_worker_events()
@@ -211,16 +257,37 @@ class Supervisor:
 
     def _finish(self):
         batch = self.store.get(self.active)
-        result = self.result or dict(state="interrupted", error="上传子进程异常退出")
+        result = self.result
+        if result is None:
+            if self.stop_event.is_set():
+                result = dict(state="interrupted", error="上传已中断")
+            else:
+                info = make_error(
+                    "local",
+                    "worker_exit",
+                    context=dict(
+                        batch_id=batch["id"],
+                        batch_path=batch["path"],
+                        exit_code=self.process.exitcode,
+                    ),
+                    message=f"上传子进程异常退出，退出码 {self.process.exitcode}",
+                    hint="请根据错误 ID 查看子进程最后的日志，检查依赖、内存及系统进程终止记录。",
+                )
+                result = dict(state="interrupted", error=summary(info), error_info=info)
+                log_error(logger, info)
         if self.cleanup_only:
             if result.get("event") == "cleaned":
-                self.store.update(self.active, cleanup_pending=0, retry_at=0)
+                if batch.get("cleanup_error_info"):
+                    logger.info("异常已恢复：%s", summary(batch["cleanup_error_info"]))
+                self.store.update(
+                    self.active, cleanup_pending=0, retry_at=0, cleanup_error_info=None
+                )
             else:
                 self.store.update(
                     self.active,
                     cleanup_pending=1,
                     retry_at=time.time() + 5,
-                    error=result.get("error", "清理失败"),
+                    cleanup_error_info=result.get("error_info"),
                 )
         else:
             state = result["state"]
@@ -233,16 +300,27 @@ class Supervisor:
                             node.state = 0 if state == "interrupted" else 3
                         if state == "rejected":
                             node.state = 3
-                payload = p.serialize() if self.config.reports else None
+                try:
+                    payload = p.serialize() if self.config.reports else None
+                except Exception as exc:
+                    info = make_error("local", "serialize", exc, context=dict(batch_id=batch["id"]))
+                    log_error(logger, info)
+                    payload = None
+                    # Reporter owns serialization retries; upload outcome is unchanged.
+                    self.reporter.set(self.active, p, terminal=state == "done")
             else:
                 payload = None
             delay = (
                 min(300, 5 * 2 ** min(max(batch["attempts"] - 1, 0), 6)) if state == "failed" else 0
             )
+            info = result.get("error_info")
+            if state == "interrupted" and info is None:
+                info = batch.get("error_info")
             self.store.update(
                 self.active,
                 state=state,
-                error=result.get("error", ""),
+                error=summary(info) if info else result.get("error", ""),
+                error_info=info,
                 retry_at=time.time() + delay,
                 pending=payload,
             )
@@ -251,6 +329,8 @@ class Supervisor:
                     self.active, payload if state == "done" else p, terminal=state == "done"
                 )
             if state == "done":
+                if batch.get("error_info"):
+                    logger.info("异常已恢复：%s", summary(batch["error_info"]))
                 self.progress.pop(self.active, None)
             self.cleanup(self.store.get(self.active))
             if result.get("error"):
@@ -264,6 +344,15 @@ class Supervisor:
         rows = self.store.rows()
         counts = dict(collections.Counter(r["state"] for r in rows))
         active = self.store.get(self.active) if self.active else None
+        batch_errors = [
+            dict(path=r["path"], state=r["state"], error=summary(info), error_info=info)
+            for r in rows
+            for info in (r["error_info"], r["cleanup_error_info"])
+            if info
+        ]
+        current = self.error_info
+        if current is None and batch_errors:
+            current = batch_errors[-1]["error_info"]
         return dict(
             state=state,
             run_mode=self.config.run_mode,
@@ -275,34 +364,57 @@ class Supervisor:
             counts=counts,
             active_batch=active["path"] if active else None,
             progress=self.progress[self.active].summary() if self.active in self.progress else {},
-            error=self.last_error,
+            error=summary(current) if current else "",
+            error_info=current,
             reporter=self.reporter.diagnostics(),
-            batch_errors=[
-                {"path": r["path"], "state": r["state"], "error": r["error"]}
-                for r in rows
-                if r["error"]
-            ][-50:],
+            batch_errors=batch_errors[-50:],
         )
 
     def run(self):
-        self.initialize()
+        failed = False
         next_scan = next_status = 0
         try:
+            self.initialize()
             while not self.stop_event.is_set():
                 self.drain()
                 now = time.monotonic()
                 if now >= next_scan:
                     try:
                         self.scan()
+                        if self.error_info and self.error_info["stage"] == "scan":
+                            logger.info("异常已恢复：%s", summary(self.error_info))
+                            self.error_info = None
                     except (OSError, RejectedBatch) as exc:
-                        self.last_error = str(exc)
+                        self.error_info = make_error(
+                            "local", "scan", exc, context=dict(path=str(self.config.source_dir))
+                        )
+                        log_error(logger, self.error_info)
                     next_scan = now + 2
                 if self.process is None:
                     self.launch_next()
                 if now >= next_status:
-                    write_json(self.status_path, self.snapshot())
+                    try:
+                        write_json(self.status_path, self.snapshot())
+                    except Exception as exc:
+                        raise DiagnosticError(
+                            make_error(
+                                "local", "status", exc, context=dict(path=str(self.status_path))
+                            )
+                        ) from exc
                     next_status = now + 1
                 self.stop_event.wait(0.05)
+        except Exception as exc:
+            failed = True
+            self.stop_event.set()
+            self.error_info = (
+                exc.info
+                if isinstance(exc, DiagnosticError)
+                else make_error(
+                    "local", "database" if isinstance(exc, sqlite3.Error) else "runtime", exc
+                )
+            )
+            log_error(logger, self.error_info)
+            raise DiagnosticError(self.error_info) from exc
         finally:
             if self.process:
                 with contextlib.suppress(OSError):
@@ -321,8 +433,10 @@ class Supervisor:
                     self.drain()
             self.reporter.close()
             self.drain()
-            write_json(self.status_path, self.snapshot("stopped"))
-            self.store.close()
+            try:
+                write_json(self.status_path, self.snapshot("failed" if failed else "stopped"))
+            finally:
+                self.store.close()
 
 
 def main(config_path, handshake, effective_path=None):
@@ -330,6 +444,8 @@ def main(config_path, handshake, effective_path=None):
     private_dir(root)
     z_path = None
     supervisor = listener = None
+    config = None
+    stage = "config"
     try:
         with InstanceLock(root / "instance.lock"):
             config = (
@@ -344,6 +460,7 @@ def main(config_path, handshake, effective_path=None):
             from .workspace import check_mode
 
             check_mode(config)
+            stage = "logging"
             handler = RotatingFileHandler(
                 config.work_dir / "ingestion.log",
                 maxBytes=5 * 1024 * 1024,
@@ -357,6 +474,7 @@ def main(config_path, handshake, effective_path=None):
             )
             logger.info("Starting ingestion run_mode=%s", config.run_mode)
             if config.uploads:
+                stage = "obs_initializing"
                 from cloudrobo_core.sdk import Config
 
                 credentials = Config()
@@ -366,7 +484,9 @@ def main(config_path, handshake, effective_path=None):
             # if the first batch has not arrived yet. Router availability is optional.
             reporter = DisabledReporter()
             if config.reports:
+                stage = "serialize"
                 message_class()
+                stage = "report_config"
                 from cloudrobo_r2c.common.config import ClientConfig
                 from cloudrobo_r2c.transport import ZenohTransport
 
@@ -383,13 +503,21 @@ def main(config_path, handshake, effective_path=None):
                     )
                     yaml.safe_dump(z, f, allow_unicode=True)
                 ClientConfig.from_yaml(z_path, None, None, None).validate()
-                reporter = Reporter(z_path, config.topic)
+                reporter = Reporter(
+                    z_path,
+                    config.topic,
+                    endpoints=config.zenoh.get("connect", {}).get(
+                        "endpoints", config.zenoh["endpoints"]
+                    ),
+                )
             if config.run_mode == "mock_report":
                 from .mock_runtime import MockRunner
 
                 supervisor = MockRunner(config, reporter, root / "status.json")
             else:
+                stage = "database"
                 supervisor = Supervisor(config, reporter, root / "status.json")
+            stage = "control"
             token = os.urandom(32)
             listener = Listener(("127.0.0.1", 0), authkey=token)
             write_json(root / "control.json", dict(port=listener.address[1], token=token.hex()))
@@ -417,17 +545,65 @@ def main(config_path, handshake, effective_path=None):
                 handshake,
                 dict(pid=os.getpid(), work_dir=str(config.work_dir), run_mode=config.run_mode),
             )
+            stage = "runtime"
             supervisor.run()
     except Exception as exc:
-        logger.exception("Ingestion daemon failed")
-        if not Path(handshake).exists():
-            write_json(handshake, dict(error=str(exc)))
-        raise
+        info = getattr(supervisor, "error_info", None) or (
+            exc.info
+            if isinstance(exc, DiagnosticError)
+            else make_error(
+                "obs"
+                if stage == "obs_initializing"
+                else "report"
+                if stage == "report_config"
+                else "local",
+                stage,
+                exc,
+                context=dict(
+                    config=str(config_path),
+                    path=str(config.work_dir / "ingestion.log")
+                    if stage == "logging"
+                    else str(root / "status.json"),
+                ),
+            )
+        )
+        log_error(logger, info)
+        failure_status = dict(state="failed", running=False, error=summary(info), error_info=info)
+        if supervisor:
+            with contextlib.suppress(OSError, ValueError):
+                existing = json.loads((root / "status.json").read_text(encoding="utf-8"))
+                failure_status = existing | failure_status
+        if config:
+            failure_status.update(
+                run_mode=config.run_mode,
+                work_dir=str(config.work_dir),
+                source_dir=str(config.source_dir) if config.source_dir else None,
+                obs_path=config.obs_path,
+                pid=os.getpid(),
+                updated_ms=now_ms(),
+            )
+        with contextlib.suppress(OSError):
+            write_json(root / "status.json", failure_status)
+        with contextlib.suppress(OSError):
+            write_json(handshake, dict(error=summary(info), error_info=info))
+        raise DiagnosticError(info) from exc
     finally:
+        if supervisor:
+            supervisor.stop_event.set()
         if listener:
-            listener.close()
+            try:
+                listener.close()
+            except OSError as exc:
+                log_error(logger, make_error("local", "control", exc), logging.WARNING)
         if z_path:
-            z_path.unlink(missing_ok=True)
+            try:
+                z_path.unlink(missing_ok=True)
+            except OSError as exc:
+                log_error(
+                    logger,
+                    make_error("local", "cleanup", exc, context=dict(path=str(z_path))),
+                    logging.WARNING,
+                )
 
 
 if __name__ == "__main__":

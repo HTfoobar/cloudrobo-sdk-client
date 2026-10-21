@@ -141,12 +141,42 @@ OBS SDK checkpoint 独立于副本，确认分段上传中止后删除；强制�
 残留分段，建议桶设置清理未完成 multipart 的生命周期策略作为兜底。
 清理失败不丢记录，暂停该批次并继续其他任务。
 
+### 错误提示与日志
+
+`status` 分别展示 **OBS 上传异常、进度上报异常、本地处理异常**，包括中文原因、
+失败阶段、文件或地址、排查建议及错误 ID。上传成功与进度上报成功分别判断，
+上报失败不会改写 OBS 上传结果。对应操作恢复成功后清除当前异常，日志记录恢复事件。
+仅上传模式始终显示“上报未启用”。
+
+例如 endpoint 无法解析时：
+
+```text
+OBS 上传异常 [OBS_DNS_FAILED]
+阶段：上传 OBS 文件
+原因：OBS 上传失败：无法解析服务器地址
+endpoint：https://obs.example.invalid
+file：data/chunk-000/file-000.parquet
+建议：请检查服务器地址、区域配置和本机 DNS。
+错误 ID：……
+```
+
+router 无法连接时显示“进度上报异常”，附带连接地址和 topic。进度消息构建失败
+属于“本地处理异常 / 构建进度消息”，不会误报为 router 故障。未知原因保留原始诊断，
+明确提示失败模块，不将所有 `OSError` 都解释成地址、网络或权限问题。
+
+`status --json` 的顶层、`batch_errors` 和 `reporter` 使用统一 `error_info`：
+`error_id`、`component`（obs/report/local）、`stage`、`code`、`message`、`hint`、
+`time_ms`、`context`、`details`。Reporter 的 `errors` 可同时包含连接或消息构建错误。
+批次诊断持久化，支持离线查询；致命退出尽可能保存 `state=failed`，与正常停止区分。
+如果无法读取实例锁，显示“状态无法确定”及失败路径。错误 ID 用于关联状态与详细日志。
+
 日志位于本次运行实际使用的 `work_dir/ingestion.log`（包括 CLI `--work-dir`
 覆盖后的目录），单文件最大 5 MiB，保留 3 份轮转备份 `ingestion.log.1`～`.3`。
 上传子进程通过 IPC 将日志交给主进程统一写入，记录批次 ID、失败阶段、文件、
 本地副本和 OBS 目标。OBS 失败时记录可用的 HTTP 状态码、错误码、请求 ID；
-异常保留脱敏消息、errno/Windows winerror 和调用栈位置，不记录凭证、签名
-查询参数或栈局部变量。`status` / `status --json` 也显示失败摘要。
+异常保留原因链、脱敏消息、errno/Windows winerror 和调用栈位置，不记录凭证、签名
+查询参数或栈局部变量。重复的上报异常首次立即记录，其后同类错误每 60 秒汇总次数；
+错误变化与恢复立即记录。上报只保留当前诊断，不累积逐次重试历史。
 
 Windows PowerShell 实时查看（将路径替换为实际工作目录）：
 
@@ -155,9 +185,9 @@ cloudrobo ingestion status --json
 Get-Content 'C:\data\ingestion-upload-work\ingestion.log' -Tail 100 -Wait
 ```
 
-例如 `stage=uploading; http_status=403; error_code=AccessDenied` 表示 OBS
-权限错误；`stage=copying` 加 `winerror` 表示复制阶段的 Windows 文件操作错误。
-此改动只对升级并重启后的失败生效，旧日志中被省略的原因无法恢复。
+例如 `OBS_ACCESS_DENIED` 加 HTTP 403 / `AccessDenied` 表示 OBS 访问被拒绝；
+`stage=copying` 加 `winerror` 表示复制阶段的 Windows 文件操作错误。
+功能尚未上线，本次调整不提供旧数据库迁移，开发验证请使用新的工作目录。
 
 每秒发送每批全量节点，不限制为 8 KB。状态变更即时发送，断连期间只保留最新
 快照及待发布最终消息，不积压逐秒历史。超限等无法生成完整节点清单的错误通过

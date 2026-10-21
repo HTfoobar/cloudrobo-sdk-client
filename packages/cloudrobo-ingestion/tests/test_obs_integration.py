@@ -110,6 +110,10 @@ def test_real_obs_sdk_in_spawned_worker(config, batch_dir, monkeypatch, run_mode
         assert "Uploading file" in log
         assert batch["id"] in log and "data/file-000.parquet" in log
         if http_status != 200:
+            assert batch["error_info"]["component"] == "obs"
+            assert batch["error_info"]["code"] == "OBS_ACCESS_DENIED"
+            assert batch["error_info"]["error_id"] in log
+            assert s.snapshot()["error_info"] == batch["error_info"]
             for expected in ("403", "AccessDenied", "test-request-id"):
                 assert expected in batch["error"]
                 assert expected in log

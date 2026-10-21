@@ -111,9 +111,11 @@ def test_worker_reports_windows_error_with_stack_and_stage(config, batch_dir, mo
     conn = Connection()
     run_worker(config, batch, manifest(batch_dir), conn)
     result = next(e for e in conn.messages if e["event"] == "result")
-    assert "stage=uploading" in result["error"]
+    assert result["error_info"]["component"] == "local"
+    assert result["error_info"]["stage"] == "upload_local_io"
     assert "PermissionError" in result["error"]
-    assert "winerror=32" in result["error"] and "errno=13" in result["error"]
+    assert result["error_info"]["details"]["winerror"] == 32
+    assert result["error_info"]["details"]["errno"] == 13
     logs = "\n".join(e["message"] for e in conn.messages if e["event"] == "log")
     assert "stack" in logs and "upload_file" in logs
     assert "OBS client close failed" in logs
@@ -160,8 +162,13 @@ def successful_child(config, batch, entries, connection, cleanup_only):
 
 
 def failed_child(config, batch, entries, connection, cleanup_only):
+    from cloudrobo_ingestion.diagnostics import make_error, summary
+
     (config.work_dir / "staging" / batch["id"]).mkdir()
-    connection.send(dict(event="result", state="failed", error="mock upload failed"))
+    info = make_error(
+        "obs", "uploading", diagnostic=dict(http_status=403, error_code="AccessDenied")
+    )
+    connection.send(dict(event="result", state="failed", error=summary(info), error_info=info))
     connection.close()
 
 
@@ -170,12 +177,34 @@ def blocked_child(config, batch, entries, connection, cleanup_only):
     time.sleep(60)
 
 
+def crashed_child(config, batch, entries, connection, cleanup_only):
+    raise SystemExit(7)
+
+
 def drain_until_done(s):
     deadline = time.monotonic() + 10
     while s.process is not None and time.monotonic() < deadline:
         s.drain()
         time.sleep(0.02)
     assert s.process is None
+
+
+def test_unexpected_worker_exit_reports_exit_code(config, batch_dir):
+    s = Supervisor(
+        config,
+        Reporter("unused", config.topic),
+        config.work_dir / "status.json",
+        worker_target=crashed_child,
+    )
+    try:
+        s.scan()
+        s.launch_next()
+        drain_until_done(s)
+        info = s.snapshot()["error_info"]
+        assert info["component"] == "local" and info["stage"] == "worker_exit"
+        assert info["context"]["exit_code"] == 7
+    finally:
+        s.store.close()
 
 
 def test_supervisor_success_cleanup_and_skip_restart(config, batch_dir):
@@ -203,7 +232,7 @@ def test_supervisor_success_cleanup_and_skip_restart(config, batch_dir):
     restarted.store.close()
 
 
-def test_supervisor_failure_retries_after_recopy(config, batch_dir):
+def test_supervisor_failure_retries_after_recopy(config, batch_dir, caplog):
     r = Reporter("unused", config.topic)
     s = Supervisor(config, r, config.work_dir / "status.json", worker_target=failed_child)
     s.scan()
@@ -211,16 +240,20 @@ def test_supervisor_failure_retries_after_recopy(config, batch_dir):
     drain_until_done(s)
     b = s.store.rows()[0]
     assert b["state"] == "failed" and b["retry_at"] > time.time()
+    assert s.snapshot()["error_info"]["component"] == "obs"
     assert not (config.work_dir / "staging" / b["id"]).exists()
     s.launch_next()
     assert s.process is None
     s.store.update(b["id"], retry_at=0)
     s.worker_target = successful_child
+    caplog.set_level("INFO")
     s.launch_next()
     drain_until_done(s)
     new = s.store.rows()[0]
     assert new["state"] == "done" and new["attempts"] == 2
     assert new["id"] == b["id"] and new["timestamp"] == b["timestamp"]
+    assert new["error_info"] is None and s.snapshot()["error_info"] is None
+    assert "异常已恢复" in caplog.text
     s.store.close()
 
 
@@ -240,9 +273,13 @@ def test_recovery_cleans_interrupted_staging(config, batch_dir):
 
 
 def test_stop_terminates_blocked_upload(config, batch_dir):
+    from cloudrobo_ingestion.diagnostics import make_error
+
     r = Reporter("unused", config.topic, factory=lambda _: None)
     s = Supervisor(config, r, config.work_dir / "status.json", worker_target=blocked_child)
     s.scan()
+    previous = make_error("obs", "uploading", TimeoutError("timed out"))
+    s.batch_error(s.store.rows()[0], previous)
     s.launch_next()
     r.start()
     s.stop_event.set()
@@ -253,5 +290,6 @@ def test_stop_terminates_blocked_upload(config, batch_dir):
     store = BatchStore(config)
     b = store.rows()[0]
     assert b["state"] == "interrupted"
+    assert b["error_info"]["error_id"] == previous["error_id"]
     assert not (config.work_dir / "staging" / b["id"]).exists()
     store.close()
