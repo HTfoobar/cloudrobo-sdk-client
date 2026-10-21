@@ -139,7 +139,7 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
             if stop.is_set():
                 raise InterruptedBatch()
             active = entry.path
-            send("file", path=active, state=1, transferred=0)
+            send("file", path=active, state=1, transferred=0, begin=True)
             last = [0.0]
 
             def progress(transferred, total, elapsed, path=entry.path, last=last):

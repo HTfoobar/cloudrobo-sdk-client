@@ -48,8 +48,8 @@ class Node:
 
     def update(self, state, transferred=0, at=None):
         at = time.monotonic() if at is None else at
-        # OBS can deliver a queued callback after the file completion event.
-        if self.state == 2 and state == 1:
+        # A late callback cannot undo completion or a reported attempt failure.
+        if self.state in (2, 3) and state == 1:
             return
         if self.state == state == 1:
             transferred = max(self.transferred, transferred)
@@ -91,19 +91,55 @@ class Node:
 
 
 class BatchProgress:
-    def __init__(self, batch, entries, source, clock=None):
+    def __init__(self, batch, entries, source, clock=None, failed=False):
         self.batch, self.source = dict(batch), source
         self.clock = clock or time.monotonic
         self.nodes = {
             e.path: Node(e.path, e.size, str(uuid.uuid5(uuid.UUID(batch["id"]), e.path)))
             for e in entries
         }
+        self.entries = {e.path: e for e in entries}
         self.finished = False
         self.lock = threading.Lock()
+        if failed:
+            self.mark_failed()
 
-    def update(self, path, state, transferred=0):
+    def update(self, path, state, transferred=0, begin=False):
         with self.lock:
+            if begin:
+                # A real new attempt is different from a late SDK callback.
+                old = self.nodes[path]
+                self.nodes[path] = Node(old.path, old.size, old.file_id)
             self.nodes[path].update(state, transferred, at=self.clock())
+
+    def mark_failed(self):
+        """The whole attempt failed, including files it could not start."""
+        with self.lock:
+            self.finished = False
+            for node in self.nodes.values():
+                if node.state != 2:
+                    node.update(3, node.transferred, at=self.clock())
+
+    def prepare(self, entries, failed=False):
+        """Retain observed states during recopy/init; reset only on real file start."""
+        with self.lock:
+            nodes = {}
+            for entry in entries:
+                old = self.nodes.get(entry.path)
+                nodes[entry.path] = (
+                    old
+                    if old and self.entries.get(entry.path) == entry
+                    else Node(
+                        entry.path,
+                        entry.size,
+                        str(uuid.uuid5(uuid.UUID(self.batch["id"]), entry.path)),
+                    )
+                )
+            self.nodes = nodes
+            self.entries = {e.path: e for e in entries}
+            self.finished = False
+        if failed:
+            self.mark_failed()
 
     def serialize(self):
         with self.lock:

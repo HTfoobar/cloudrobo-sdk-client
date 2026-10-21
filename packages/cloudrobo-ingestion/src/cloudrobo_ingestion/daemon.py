@@ -56,6 +56,25 @@ class Supervisor:
             updates.update(error=summary(info), error_info=info)
         self.store.update(batch["id"], **updates)
         log_error(logger, info)
+        if not cleanup or batch["state"] != "done":
+            self.fail_progress(batch["id"])
+
+    def fail_progress(self, batch_id):
+        progress = self.progress.get(batch_id)
+        if progress is None:
+            return
+        progress.mark_failed()
+        # Wake the publisher before persisting; a DB fault must not hide failure.
+        self.reporter.set(batch_id, progress)
+        if self.config.reports:
+            try:
+                payload = progress.serialize()
+            except Exception as exc:
+                log_error(
+                    logger, make_error("local", "serialize", exc, context=dict(batch_id=batch_id))
+                )
+            else:
+                self.store.update(batch_id, pending=payload)
 
     def batch_failure(self, batch, stage, exc, **updates):
         self.batch_error(
@@ -98,7 +117,7 @@ class Supervisor:
         for batch in self.store.rows():
             self.cleanup(batch)
             if self.config.reports and batch["pending"] is not None:
-                self.reporter.set(batch["id"], batch["pending"], terminal=True)
+                self.reporter.set(batch["id"], batch["pending"], terminal=batch["state"] == "done")
 
     def scan(self):
         for source in discover(self.config.source_dir):
@@ -110,7 +129,12 @@ class Supervisor:
                 continue
             try:
                 entries = manifest(source, self.config.max_files_per_batch)
-                progress = BatchProgress(batch, entries, self.source)
+                progress = BatchProgress(
+                    batch,
+                    entries,
+                    self.source,
+                    failed=batch["attempts"] > 0 or bool(batch["error_info"]),
+                )
                 self.progress[batch["id"]] = progress
                 self.store.update(
                     batch["id"], files=len(entries), bytes=sum(e.size for e in entries)
@@ -118,7 +142,6 @@ class Supervisor:
                 self.reporter.set(batch["id"], progress)
             except RejectedBatch as exc:
                 self.batch_failure(batch, "scan", exc, state="rejected", pending=None)
-                self.reporter.remove(batch["id"])
             except OSError as exc:
                 self.batch_failure(
                     batch,
@@ -158,8 +181,6 @@ class Supervisor:
                 )
             except RejectedBatch as exc:
                 self.batch_failure(batch, "scan", exc, state="rejected", pending=None)
-                self.progress.pop(batch["id"], None)
-                self.reporter.remove(batch["id"])
                 continue
             except OSError as exc:
                 self.batch_failure(
@@ -170,7 +191,12 @@ class Supervisor:
                     retry_at=time.time() + 5,
                 )
                 continue
-            p = BatchProgress(batch, entries, self.source)
+            failed = batch["attempts"] > 0 or bool(batch["error_info"])
+            p = self.progress.get(batch["id"])
+            if p is None:
+                p = BatchProgress(batch, entries, self.source, failed=failed)
+            else:
+                p.prepare(entries, failed=failed)
             self.progress[batch["id"]] = p
             self.reporter.set(batch["id"], p)
             self.store.update(
@@ -211,7 +237,10 @@ class Supervisor:
                     kind = event["event"]
                     if kind == "file":
                         self.progress[self.active].update(
-                            event["path"], event["state"], event["transferred"]
+                            event["path"],
+                            event["state"],
+                            event["transferred"],
+                            begin=event.get("begin", False),
                         )
                     elif kind == "phase":
                         self.store.update(self.active, state=event["state"])
@@ -227,6 +256,8 @@ class Supervisor:
                         )
                     elif kind in ("result", "cleaned"):
                         self.result = event
+                        if event.get("state") in ("failed", "rejected"):
+                            self.fail_progress(self.active)
                     elif kind == "cleanup_error":
                         self.batch_error(
                             self.store.get(self.active),
@@ -273,7 +304,7 @@ class Supervisor:
                     message=f"上传子进程异常退出，退出码 {self.process.exitcode}",
                     hint="请根据错误 ID 查看子进程最后的日志，检查依赖、内存及系统进程终止记录。",
                 )
-                result = dict(state="interrupted", error=summary(info), error_info=info)
+                result = dict(state="failed", error=summary(info), error_info=info)
                 log_error(logger, info)
         if self.cleanup_only:
             if result.get("event") == "cleaned":
@@ -293,13 +324,15 @@ class Supervisor:
             state = result["state"]
             p = self.progress.get(self.active)
             if p:
-                with p.lock:
-                    p.finished = state == "done"
-                    for node in p.nodes.values():
-                        if node.state == 1:
-                            node.state = 0 if state == "interrupted" else 3
-                        if state == "rejected":
-                            node.state = 3
+                if state in ("failed", "rejected"):
+                    p.mark_failed()
+                else:
+                    with p.lock:
+                        p.finished = state == "done"
+                        if state == "interrupted":
+                            for node in p.nodes.values():
+                                if node.state == 1:
+                                    node.state = 0
                 try:
                     payload = p.serialize() if self.config.reports else None
                 except Exception as exc:
@@ -414,6 +447,9 @@ class Supervisor:
                 )
             )
             log_error(logger, self.error_info)
+            for batch_id in self.progress:
+                with contextlib.suppress(Exception):
+                    self.fail_progress(batch_id)
             raise DiagnosticError(self.error_info) from exc
         finally:
             if self.process:

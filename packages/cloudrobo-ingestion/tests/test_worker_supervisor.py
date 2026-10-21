@@ -82,10 +82,12 @@ def test_supervisor_checks_limit_on_discovery_and_before_upload(config, batch_di
         assert s.store.rows()[0]["state"] == "rejected"
         assert "配置上限 1" in s.store.rows()[0]["error"]
         assert not list((config.work_dir / "staging").iterdir())
-        s.store.recover()
+        assert s.progress[s.store.rows()[0]["id"]].summary()["failed_files"] == 1
+        s.store.close()
+        s = Supervisor(config, reporter, config.work_dir / "status.json")
         s.scan()
         assert s.store.rows()[0]["state"] == "rejected"
-        assert not s.progress
+        assert not s.progress  # Cannot build a new legal list after restarting.
     finally:
         s.store.close()
 
@@ -203,6 +205,9 @@ def test_unexpected_worker_exit_reports_exit_code(config, batch_dir):
         info = s.snapshot()["error_info"]
         assert info["component"] == "local" and info["stage"] == "worker_exit"
         assert info["context"]["exit_code"] == 7
+        batch = s.store.rows()[0]
+        assert batch["state"] == "failed" and batch["retry_at"] > time.time()
+        assert message_class().FromString(batch["pending"]).nodes[0].result_state == 3
     finally:
         s.store.close()
 
@@ -233,6 +238,8 @@ def test_supervisor_success_cleanup_and_skip_restart(config, batch_dir):
 
 
 def test_supervisor_failure_retries_after_recopy(config, batch_dir, caplog):
+    for i in range(2):
+        (batch_dir / "data" / f"queued-{i}.parquet").write_bytes(b"sample")
     r = Reporter("unused", config.topic)
     s = Supervisor(config, r, config.work_dir / "status.json", worker_target=failed_child)
     s.scan()
@@ -241,6 +248,7 @@ def test_supervisor_failure_retries_after_recopy(config, batch_dir, caplog):
     b = s.store.rows()[0]
     assert b["state"] == "failed" and b["retry_at"] > time.time()
     assert s.snapshot()["error_info"]["component"] == "obs"
+    assert [n.result_state for n in message_class().FromString(b["pending"]).nodes] == [3, 3, 3]
     assert not (config.work_dir / "staging" / b["id"]).exists()
     s.launch_next()
     assert s.process is None
