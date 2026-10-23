@@ -9,4 +9,5 @@
 -e packages/cloudrobo-dispatch
 -e packages/cloudrobo-r2c
 -e packages/cloudrobo-ingestion
+-e tools/ingestion-mock[test]
 -e ./

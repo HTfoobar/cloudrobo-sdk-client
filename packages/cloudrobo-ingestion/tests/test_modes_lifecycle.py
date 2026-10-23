@@ -39,7 +39,7 @@ def install_import_guard(tmp_path, monkeypatch, condition):
     monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
 
 
-@pytest.mark.parametrize("run_mode", ["upload_only", "mock_report"])
+@pytest.mark.parametrize("run_mode", ["upload_only", "upload_and_report"])
 def test_real_child_receives_effective_cli_configuration(
     config_file, tmp_path, monkeypatch, run_mode
 ):
@@ -55,10 +55,6 @@ def test_real_child_receives_effective_cli_configuration(
             work_dir=str(work),
             task_type="CLI-task",
             collect_method="CLI-method",
-            mock_file_count=3,
-            mock_file_size_bytes=100,
-            mock_upload_bps=10,
-            mock_batch_interval_seconds=0,
             zenoh_endpoint=(unused_endpoint(),),
         ),
     )
@@ -68,15 +64,8 @@ def test_real_child_receives_effective_cli_configuration(
         assert not (tmp_path / "work").exists()
         state = wait_for(lambda: status() if status().get("run_mode") == run_mode else None)
         assert state["work_dir"] == str(work) and state["running"]
-        if run_mode == "mock_report":
-            state = wait_for(
-                lambda: status() if status().get("progress", {}).get("files") == 3 else None
-            )
-            assert state["mock"] and state["source_dir"] is None
-            assert not (work / "batches.sqlite3").exists()
-            assert not (work / "staging").exists() and not (work / "checkpoints").exists()
-        else:
-            assert state["reporter"]["enabled"] is False
+        assert state["reporter"]["enabled"] is (run_mode == "upload_and_report")
+        if run_mode == "upload_only":
             assert not list(work.glob("zenoh-*.yaml"))
         assert not list(work.glob("effective-*.json"))
         assert stop()["run_mode"] == run_mode
@@ -105,44 +94,65 @@ def test_pure_daemon_without_reporting_imports(config_file, tmp_path, monkeypatc
         stop()
 
 
-def test_mock_daemon_does_not_access_obs_or_customer_source(config_file, tmp_path, monkeypatch):
-    install_import_guard(
-        tmp_path,
-        monkeypatch,
-        "name == 'obs' or name.startswith('obs.') or name.endswith('obs_client')",
-    )
-    monkeypatch.delenv("HUAWEI_CLOUD_AK", raising=False)
-    monkeypatch.delenv("HUAWEI_CLOUD_SK", raising=False)
+def test_detached_daemon_enforces_cli_file_limit(config_file, tmp_path, monkeypatch):
+    monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("HUAWEI_CLOUD_AK", "test-ak")
+    monkeypatch.setenv("HUAWEI_CLOUD_SK", "test-sk")
+    monkeypatch.setenv("CLOUDROBO_OBS_ENDPOINT", "http://127.0.0.1:1")
+    batch = tmp_path / "source/batch"
+    batch.mkdir()
+    (batch / "__UPLOAD_READY__").touch()
+    (batch / "first.txt").write_text("first")
+    (batch / "second.txt").write_text("second")
     data = yaml.safe_load(config_file.read_text())
-    data.update(
-        run_mode="mock_report",
-        source_dir=str(tmp_path / "nonexistent-source"),
-        zenoh=dict(endpoints=[unused_endpoint()]),
-    )
+    data["max_files_per_batch"] = 10
     config_file.write_text(yaml.safe_dump(data))
-    start(config_file)
+    before = config_file.read_bytes()
+    start(config_file, dict(run_mode="upload_only", max_files_per_batch=1))
     try:
-        s = wait_for(lambda: status() if status().get("progress", {}).get("files") else None)
-        assert s["mock"] and s["run_mode"] == "mock_report" and s["source_dir"] is None
-        work = tmp_path / "work"
-        assert not (work / "batches.sqlite3").exists() and not (work / "staging").exists()
-        assert not (tmp_path / "nonexistent-source").exists()
+        state = wait_for(
+            lambda: status() if status().get("counts", {}).get("rejected") == 1 else None
+        )
+        assert "配置上限 1" in state["batch_errors"][0]["error"]
+        assert not list((tmp_path / "work/staging").iterdir())
+        assert config_file.read_bytes() == before
     finally:
         stop()
 
 
-def test_mock_initialization_cannot_modify_default_history(
-    config, config_file, tmp_path, monkeypatch
-):
+def test_detached_switches_real_modes_using_one_work_dir(config_file, tmp_path, monkeypatch):
+    from cloudrobo_ingestion.config import IngestionConfig
     from cloudrobo_ingestion.store import BatchStore
 
-    store = BatchStore(config)
-    b = store.add("completed", config)
-    store.update(b["id"], state="done", pending=b"durable-real-final")
-    store.close()
     monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
-    before = (config.work_dir / "batches.sqlite3").read_bytes()
-    with pytest.raises(ValueError, match="绑定模式"):
-        start(config_file, dict(run_mode="mock_report"))
-    assert (config.work_dir / "batches.sqlite3").read_bytes() == before
-    assert not (tmp_path / "runtime").exists()
+    monkeypatch.setenv("HUAWEI_CLOUD_AK", "test-ak")
+    monkeypatch.setenv("HUAWEI_CLOUD_SK", "test-sk")
+    config = IngestionConfig.load(config_file)
+    try:
+        start(config_file)
+        assert status()["run_mode"] == "upload_and_report"
+        stop()
+        # An empty batch exercises copy/success/cleanup without an OBS server.
+        batch = config.source_dir / "empty-batch"
+        batch.mkdir()
+        (batch / "__UPLOAD_READY__").touch()
+        pure = start(config_file, dict(run_mode="upload_only"))
+        assert pure["work_dir"] == str(config.work_dir)
+        wait_for(lambda: status().get("counts", {}).get("done") == 1)
+        stop()
+        start(config_file)
+        state = wait_for(lambda: status() if status().get("counts", {}).get("done") == 1 else None)
+        assert state["run_mode"] == "upload_and_report"
+        assert not state["reporter"]["pending_batches"]
+        stop()
+        store = BatchStore(config)
+        try:
+            row = store.rows()[0]
+            assert row["attempts"] == 1 and row["state"] == "done"
+            assert not row["report_enabled"]
+            assert row["pending"] is row["final_snapshot"] is None
+        finally:
+            store.close()
+    finally:
+        if running():
+            stop()

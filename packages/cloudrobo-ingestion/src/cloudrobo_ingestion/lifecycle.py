@@ -109,13 +109,32 @@ def running(root=None):
 
 def status():
     root = runtime_dir()
-    live = running(root)
+    from .diagnostics import make_error, summary
+
     try:
-        value = json.loads((root / "status.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        live = running(root)
+    except OSError as exc:
+        info = make_error("local", "control", exc, context=dict(path=str(root / "instance.lock")))
+        return dict(running=False, state="unknown", error=summary(info), error_info=info)
+    try:
+        for attempt in range(5):
+            try:
+                value = json.loads((root / "status.json").read_text(encoding="utf-8"))
+                break
+            except PermissionError:
+                # Windows can briefly deny opening the old status file while
+                # the daemon atomically replaces it. Keep persistent failures
+                # visible, but do not discard state for a transient collision.
+                if attempt == 4:
+                    raise
+                time.sleep(0.02)
+    except FileNotFoundError:
         value = {}
+    except (OSError, ValueError) as exc:
+        info = make_error("local", "status", exc, context=dict(path=str(root / "status.json")))
+        value = dict(error=summary(info), error_info=info)
     value["running"] = live
-    if not live:
+    if not live and value.get("state") != "failed":
         value["state"] = "stopped"
     return value
 
@@ -172,6 +191,10 @@ def start(config_path, overrides=None):
                 if handshake.exists():
                     result = json.loads(handshake.read_text(encoding="utf-8"))
                     if result.get("error"):
+                        if result.get("error_info"):
+                            from .diagnostics import DiagnosticError
+
+                            raise DiagnosticError(result["error_info"])
                         raise RuntimeError(result["error"])
                     return result
                 if process.poll() is not None:

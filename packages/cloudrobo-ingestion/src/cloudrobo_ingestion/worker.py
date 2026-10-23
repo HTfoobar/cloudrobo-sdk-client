@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import threading
 import time
+from urllib.parse import urlsplit
 
+from .diagnostics import DiagnosticError, make_error, summary
 from .filesystem import InterruptedBatch, RejectedBatch, checked_copy
 
 
@@ -40,6 +42,34 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
     active = None
     stage = "initializing"
     upload_error = None
+    obs_endpoint = None
+    obs_secrets = ()
+    target = urlsplit(batch["asset_path"])
+    bucket, prefix = target.netloc, target.path.lstrip("/")
+
+    def failure(exc=None, diagnostic=None):
+        component = (
+            "obs" if stage in ("obs_initializing", "uploading", "checkpoint_cleanup") else "local"
+        )
+        if component == "obs" and isinstance(exc, (TypeError, AttributeError)):
+            component = "local"
+        return make_error(
+            component,
+            stage,
+            exc,
+            diagnostic=diagnostic,
+            secrets=credential_values(client) + obs_secrets,
+            context=dict(
+                batch_id=batch["id"],
+                batch_path=batch["path"],
+                file=active,
+                endpoint=getattr(client, "endpoint", obs_endpoint),
+                asset_path=batch["asset_path"],
+                source_path=str(config.source_dir / batch["path"]),
+                staging=str(staging),
+                checkpoint=str(checkpoint),
+            ),
+        )
 
     def log(level, message, **details):
         context = dict(
@@ -59,18 +89,28 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
             level=level,
             message=redact(
                 message + " " + json.dumps(context, ensure_ascii=False),
-                credential_values(client),
+                credential_values(client) + obs_secrets,
                 limit=16000,
             ),
         )
 
     try:
         log("INFO", "Starting batch worker", cleanup_only=cleanup_only)
+        import os
+
+        from cloudrobo_core.sdk import Config
         from cloudrobo_core.sdk.obs_client import OBSClient
+
+        credentials = Config()
+        obs_secrets = (credentials.ak or "", credentials.sk or "")
+        obs_endpoint = os.environ.get("CLOUDROBO_OBS_ENDPOINT") or credentials.endpoints.get(
+            "cloudrobo-obs", ""
+        ).replace("{region}", credentials.region)
 
         if checkpoint.exists():
             stage = "checkpoint_cleanup"
-            client = OBSClient(bucket_name=config.bucket, timeout=5)
+            # abort_checkpoint_upload uses the original bucket/key inside the checkpoint.
+            client = OBSClient(config=credentials, bucket_name=bucket, timeout=5)
             if not client.abort_checkpoint_upload(str(checkpoint)):
                 raise OSError("无法确认 OBS 分段上传已清理")
         if cleanup_only:
@@ -78,7 +118,13 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
             return
         stage = "copying"
         log("INFO", "Copying batch", files=len(entries))
-        checked_copy(config.source_dir / batch["path"], staging, entries, stop)
+        checked_copy(
+            config.source_dir / batch["path"],
+            staging,
+            entries,
+            stop,
+            max_files=config.max_files_per_batch,
+        )
         if config.validation_enabled:
             stage = "validating"
             send("phase", state="validating")
@@ -87,16 +133,20 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
             validate_lerobot(staging, stop)
         if stop.is_set():
             raise InterruptedBatch()
-        if entries and client is None:
+        if entries:
             stage = "obs_initializing"
-            client = OBSClient(bucket_name=config.bucket, timeout=30)
+            # Cleanup used a short timeout; uploads need their normal timeout.
+            if client is not None:
+                client.close()
+            client = OBSClient(config=credentials, bucket_name=bucket, timeout=30)
         stage = "uploading"
         send("phase", state="uploading")
         for entry in entries:
+            stage = "preparing_file"
             if stop.is_set():
                 raise InterruptedBatch()
             active = entry.path
-            send("file", path=active, state=1, transferred=0)
+            send("file", path=active, state=1, transferred=0, begin=True)
             last = [0.0]
 
             def progress(transferred, total, elapsed, path=entry.path, last=last):
@@ -107,9 +157,7 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
                 if stop.is_set():
                     raise InterruptedBatch()
 
-            key = (
-                batch["asset_path"].split("/", 3)[3] if "/" in batch["asset_path"][6:] else ""
-            ) + entry.path
+            key = prefix + entry.path
             log(
                 "INFO",
                 "Uploading file",
@@ -118,6 +166,7 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
                 size=entry.size,
                 endpoint=getattr(client, "endpoint", ""),
             )
+            stage = "uploading"
             if not client.upload_file(
                 str(staging / entry.path),
                 key,
@@ -127,7 +176,7 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
                 if stop.is_set():
                     raise InterruptedBatch()
                 upload_error = getattr(client, "last_upload_error", None)
-                raise OSError(f"OBS 上传失败: {entry.path}")
+                raise DiagnosticError(failure(diagnostic=upload_error))
             send("file", path=entry.path, state=2, transferred=entry.size)
             log("INFO", "File uploaded")
             active = None
@@ -136,59 +185,49 @@ def run_worker(config, batch, entries, connection, cleanup_only=False):
     except InterruptedBatch:
         send("result", state="interrupted", error="上传已中断")
     except RejectedBatch as exc:
+        info = failure(exc)
         log(
             "WARNING",
             "Batch rejected",
             diagnostic=exception_details(exc, credential_values(client)),
         )
-        send("result", state="rejected", error=str(exc))
+        log("WARNING", summary(info), error_info=info)
+        send("result", state="rejected", error=summary(info), error_info=info)
     except Exception as exc:
         if active:
             send("file", path=active, state=3, transferred=0)
-        diagnostic = upload_error or exception_details(exc, credential_values(client))
-        log("ERROR", "Batch failed", diagnostic=diagnostic)
-        summary = "; ".join(
-            f"{key}={diagnostic[key]}"
-            for key in (
-                "http_status",
-                "error_code",
-                "request_id",
-                "exception_type",
-                "errno",
-                "winerror",
-                "message",
-            )
-            if diagnostic.get(key) not in (None, "")
-        )
+        info = exc.info if isinstance(exc, DiagnosticError) else failure(exc)
+        log("ERROR", "Batch failed: " + summary(info), error_info=info)
         send(
             "result",
             state="failed",
-            error=redact(
-                f"{type(exc).__name__}: 回流失败 [stage={stage}]"
-                + (f" ({active})" if active else "")
-                + (f": {summary}" if summary else ""),
-                credential_values(client),
-                limit=2000,
-            ),
+            error=summary(info),
+            error_info=info,
         )
     finally:
         if client:
-            stage = "cleanup"
+            stage = "checkpoint_cleanup"
             try:
                 if checkpoint.exists() and not client.abort_checkpoint_upload(str(checkpoint)):
-                    log("WARNING", "OBS checkpoint cleanup not confirmed")
+                    info = failure(OSError("无法确认 OBS 分段上传已清理"))
+                    log("WARNING", summary(info), error_info=info)
+                    send("cleanup_error", error_info=info)
             except Exception as exc:
+                info = failure(exc)
+                send("cleanup_error", error_info=info)
                 log(
                     "ERROR",
-                    "OBS checkpoint cleanup failed",
+                    summary(info),
                     diagnostic=exception_details(exc, credential_values(client)),
                 )
             try:
+                stage = "close"
                 client.close()
             except Exception as exc:
+                info = failure(exc)
                 log(
                     "ERROR",
-                    "OBS client close failed",
-                    diagnostic=exception_details(exc, credential_values(client)),
+                    "OBS client close failed: " + summary(info),
+                    error_info=info,
                 )
         connection.close()

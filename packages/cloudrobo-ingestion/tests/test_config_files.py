@@ -66,22 +66,56 @@ def test_manifest_checked_copy_is_read_only(config, batch_dir):
     }
 
 
-def test_manifest_limit_exact(config):
+@pytest.mark.parametrize("limit", [50, 2, 5001])
+def test_manifest_limit_exact(config, limit):
     root = config.source_dir / "many"
     root.mkdir()
     (root / "__UPLOAD_READY__").touch()
-    for i in range(5000):
+    for i in range(limit):
         (root / f"{i}.txt").touch()
-    assert len(manifest(root)) == 5000
+    assert len(manifest(root, limit)) == limit
+    if limit == 50:
+        assert len(manifest(root)) == 50
     (root / "overflow.txt").touch()
-    with pytest.raises(RejectedBatch, match="5000"):
-        manifest(root)
+    with pytest.raises(RejectedBatch, match=str(limit)):
+        manifest(root, limit)
+    if limit == 50:
+        with pytest.raises(RejectedBatch, match="50"):
+            manifest(root)
 
 
-def test_nested_batch_rejected(batch_dir):
+def test_nested_marker_ignored_and_deep_data_copied(config, batch_dir):
     (batch_dir / "data/__UPLOAD_READY__").touch()
-    with pytest.raises(RejectedBatch, match="嵌套"):
-        manifest(batch_dir)
+    entries = manifest(batch_dir)
+    assert [e.path for e in entries] == ["data/file-000.parquet"]
+    target = config.work_dir / "staged"
+    checked_copy(batch_dir, target, entries, threading.Event())
+    assert (target / "data/file-000.parquet").read_bytes() == b"customer-data"
+    assert not list(target.rglob("__UPLOAD_READY__"))
+
+
+@pytest.mark.parametrize("root_marker", [False, True])
+def test_discovery_only_direct_children(config, root_marker):
+    source = config.source_dir
+    if root_marker:
+        (source / "__UPLOAD_READY__").touch()
+    for name in ("abc", "xyz"):
+        batch = source / name
+        (batch / "def").mkdir(parents=True)
+        (batch / "__UPLOAD_READY__").touch()
+        (batch / "def/__UPLOAD_READY__").touch()
+    deep_only = source / "unmarked/inner"
+    deep_only.mkdir(parents=True)
+    (deep_only / "__UPLOAD_READY__").touch()
+    assert list(discover(source)) == [source / "abc", source / "xyz"]
+
+
+def test_discovery_root_and_deep_markers_alone_do_not_trigger(config):
+    (config.source_dir / "__UPLOAD_READY__").touch()
+    deep = config.source_dir / "abc/def"
+    deep.mkdir(parents=True)
+    (deep / "__UPLOAD_READY__").touch()
+    assert list(discover(config.source_dir)) == []
 
 
 def test_nonempty_marker_rejected(batch_dir):

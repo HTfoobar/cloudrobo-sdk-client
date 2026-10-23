@@ -44,12 +44,12 @@ def test_done_survives_recover_outbox_ack_is_conditional(config):
     store.close()
 
 
-def test_target_binding(config):
+def test_source_binding(config):
     from dataclasses import replace
 
     BatchStore(config).close()
     with pytest.raises(ValueError, match="绑定"):
-        BatchStore(replace(config, obs_path="obs://other/"))
+        BatchStore(replace(config, source_dir=config.source_dir.parent / "other"))
 
 
 def test_progress_is_current_attempt_and_zero_when_stalled(config, batch_dir):
@@ -125,4 +125,46 @@ def test_performance_5000_snapshot(config):
     elapsed = time.perf_counter() - start
     assert len(message_class().FromString(payload).nodes) == 5000
     assert elapsed < 1  # smoke budget; production p95/30-minute criteria are separate
+    store.close()
+
+
+def test_failure_retained_during_retry_and_reset_only_on_file_begin(config):
+    store = BatchStore(config)
+    batch = store.add("batch", config)
+    entries = [FileEntry(f"{i}.parquet", 100, i, i) for i in range(3)]
+    progress = BatchProgress(batch, entries, "r2c/local")
+    progress.update("0.parquet", 2, 100)
+    progress.update("1.parquet", 1, 30, begin=True)
+    progress.mark_failed()
+    failed = message_class().FromString(progress.serialize())
+    assert [n.result_state for n in failed.nodes] == [2, 3, 3]
+    assert all(n.avg_bps == n.eta_ms == 0 for n in failed.nodes)
+    progress.prepare(entries, failed=True)
+    # Recopying and late callbacks must not turn a known failure into queued/uploading.
+    progress.update("1.parquet", 1, 50)
+    assert [n.result_state for n in message_class().FromString(progress.serialize()).nodes] == [
+        2,
+        3,
+        3,
+    ]
+    progress.update("0.parquet", 1, 0, begin=True)
+    started = message_class().FromString(progress.serialize())
+    assert [n.result_state for n in started.nodes] == [1, 3, 3]
+    assert started.nodes[0].progress == 0 and started.nodes[0].start_time > 0
+    assert [n.file_id for n in started.nodes] == [n.file_id for n in failed.nodes]
+    assert started.timestamp == failed.timestamp
+    progress.update("0.parquet", 2, 100)
+    progress.update("0.parquet", 1, 80)  # Late callback after completion remains ignored.
+    assert progress.nodes["0.parquet"].state == 2
+    store.close()
+
+
+def test_changed_entry_does_not_reuse_old_completion(config):
+    store = BatchStore(config)
+    batch = store.add("batch", config)
+    progress = BatchProgress(batch, [FileEntry("file", 10, 1, 1)], "r2c/local")
+    progress.update("file", 2, 10)
+    progress.prepare([FileEntry("file", 20, 2, 2)], failed=True)
+    assert progress.nodes["file"].state == 3
+    assert progress.nodes["file"].size == 20
     store.close()

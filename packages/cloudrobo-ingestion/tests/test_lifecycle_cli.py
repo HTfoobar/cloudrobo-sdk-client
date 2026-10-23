@@ -42,6 +42,37 @@ def test_cli_status_offline(tmp_path, monkeypatch):
     assert result.exit_code == 0
 
 
+@pytest.mark.parametrize("persistent", [False, True])
+def test_status_retries_busy_windows_replacement(tmp_path, monkeypatch, persistent):
+    from pathlib import Path
+
+    from cloudrobo_ingestion import lifecycle
+
+    monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(lifecycle, "running", lambda _: True)
+    write_json(tmp_path / "status.json", dict(run_mode="upload_and_report", error="上传失败"))
+    original = Path.read_text
+    attempts = []
+
+    def read(path, *args, **kwargs):
+        if path == tmp_path / "status.json":
+            attempts.append(1)
+            if persistent or len(attempts) < 3:
+                raise PermissionError(13, "status replacement busy")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    state = status()
+    assert state["running"]
+    if persistent:
+        assert len(attempts) == 5
+        assert state["error_info"]["stage"] == "status"
+    else:
+        assert len(attempts) == 3
+        assert state["run_mode"] == "upload_and_report"
+        assert state["error"] == "上传失败"
+
+
 def test_actual_detached_daemon_lifecycle(config_file, tmp_path, monkeypatch):
     monkeypatch.setenv("CLOUDROBO_INGESTION_RUNTIME_DIR", str(tmp_path / "runtime"))
     # No data/OBS requests: test the real lock, startup handshake and IPC control.
@@ -71,7 +102,9 @@ def test_start_failure_propagates_and_releases_lock(config_file, tmp_path, monke
     c.work_dir.mkdir()
     BatchStore(c).close()
     data = yaml.safe_load(config_file.read_text())
-    data["obs_path"] = "obs://different/target/"
+    other_source = config_file.parent / "different-source"
+    other_source.mkdir()
+    data["source_dir"] = str(other_source)
     config_file.write_text(yaml.safe_dump(data))
     monkeypatch.setenv("HUAWEI_CLOUD_AK", "test-ak")
     monkeypatch.setenv("HUAWEI_CLOUD_SK", "test-sk")
